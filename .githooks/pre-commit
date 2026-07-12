@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+staged_go=$(git diff --cached --name-only --diff-filter=ACM -- '*.go' || true)
+if [[ -n "$staged_go" ]]; then
+  # shellcheck disable=SC2086
+  unformatted=$(gofmt -l $staged_go)
+  if [[ -n "$unformatted" ]]; then
+    echo "gofmt rewriting:"
+    echo "$unformatted"
+    # shellcheck disable=SC2086
+    gofmt -w $unformatted
+    # shellcheck disable=SC2086
+    git add $unformatted
+  fi
+fi
+
+echo "go vet ./..."
+go vet ./...
+
+echo "go test ./..."
+go test ./...

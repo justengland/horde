@@ -75,7 +75,7 @@ func TestSearchNotesAND(t *testing.T) {
 
 func mustStore(t *testing.T, root string) *vault.Store {
 	t.Helper()
-	store, err := server.NewStore(root, nil, 2*1024*1024)
+	store, err := server.NewStore(root, nil, 2*1024*1024, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}

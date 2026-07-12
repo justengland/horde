@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/justengland/horde/internal/config"
+	"github.com/justengland/horde/internal/git"
 	"github.com/justengland/horde/internal/server"
 )
 
@@ -22,19 +23,21 @@ func main() {
 		slog.Error("vault", "err", err)
 		os.Exit(1)
 	}
+	var gitRepo *git.Repo
 	if cfg.GitEnabled {
 		if err := server.CheckGitRepo(cfg.Root); err != nil {
 			slog.Error("git", "err", err)
 			os.Exit(1)
 		}
+		gitRepo = &git.Repo{Root: cfg.Root, Push: cfg.GitPush}
 	}
-	store, err := server.NewStore(cfg.Root, cfg.Ignore, cfg.MaxNoteBytes)
+	store, err := server.NewStore(cfg.Root, cfg.Ignore, cfg.MaxNoteBytes, gitRepo, cfg.ReadOnly)
 	if err != nil {
 		slog.Error("store", "err", err)
 		os.Exit(1)
 	}
 	handler := server.NewHTTPServer(server.Deps{Store: store, Token: cfg.Token})
-	slog.Info("horde listening", "addr", cfg.Addr, "root", cfg.Root, "version", server.Version)
+	slog.Info("horde listening", "addr", cfg.Addr, "root", cfg.Root, "version", server.Version, "readonly", cfg.ReadOnly)
 	if err := http.ListenAndServe(cfg.Addr, handler); err != nil {
 		slog.Error("serve", "err", err)
 		os.Exit(1)

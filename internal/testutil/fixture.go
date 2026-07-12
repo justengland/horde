@@ -36,7 +36,15 @@ func FixtureVault(t *testing.T) (*vault.Store, string) {
 	if err := exec.Command("git", "-C", root, "init").Run(); err != nil {
 		t.Fatal(err)
 	}
-	store, err := server.NewStore(root, nil, 2*1024*1024)
+	for _, args := range [][]string{
+		{"config", "user.email", "mcp@pluto"},
+		{"config", "user.name", "horde"},
+	} {
+		if err := exec.Command("git", append([]string{"-C", root}, args...)...).Run(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := server.NewStore(root, nil, 2*1024*1024, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}

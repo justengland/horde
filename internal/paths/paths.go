@@ -10,7 +10,7 @@ import (
 
 const MaxSegmentLen = 255
 
-var DefaultExcluded = []string{".obsidian", ".git", ".trash"}
+var DefaultExcluded = []string{".obsidian", ".git", ".trash", ".claude"}
 
 // Vault resolves root-relative vault paths safely.
 type Vault struct {

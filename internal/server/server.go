@@ -4,18 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
 	"time"
 
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/justengland/horde/internal/auth"
+	"github.com/justengland/horde/internal/git"
 	"github.com/justengland/horde/internal/paths"
 	"github.com/justengland/horde/internal/vault"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const Version = "0.1.0-m1"
+const Version = "0.2.0-m2"
 
 const Instructions = "Before creating or editing notes in a wiki, read `<wiki>/taxonomy.md` and follow it. If it does not exist, propose one using `create_note` before making other changes. Paths are root-relative with forward slashes and must begin with a wiki name (e.g. `network/opnsense/wan-failover.md`). Prefer `update_note` patch mode over replace. Deletes are git-recoverable. `move_note` does not rewrite wikilinks."
 
@@ -47,11 +49,11 @@ func writeHealth(w http.ResponseWriter, root string) {
 		}
 	}
 	resp := map[string]any{
-		"status":    "ok",
-		"version":   Version,
-		"vault":     root,
-		"vault_ok":  vaultOK,
-		"git_ok":    gitOK(root),
+		"status":   "ok",
+		"version":  Version,
+		"vault":    root,
+		"vault_ok": vaultOK,
+		"git_ok":   gitOK(root),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -78,7 +80,7 @@ func newMCPServer(store *vault.Store) *mcp.Server {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "list_wikis",
+		Name:        "list_wikis",
 		Description: "Orientation call — enumerate top-level wikis under the vault root. Example: list_wikis() → [{name, note_count, has_taxonomy, modified}]. Paths in other tools are root-relative and must start with a wiki name.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, listWikisOut, error) {
 		wikis, err := store.ListWikis()
@@ -89,7 +91,7 @@ func newMCPServer(store *vault.Store) *mcp.Server {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "list_notes",
+		Name:        "list_notes",
 		Description: "List markdown notes under a path prefix. Example: list_notes({path_prefix: \"network\", recursive: true, sort: \"modified\", limit: 50}). Returns [{path, size, modified}] with root-relative paths.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in listNotesIn) (*mcp.CallToolResult, listNotesOut, error) {
 		recursive := true
@@ -104,7 +106,7 @@ func newMCPServer(store *vault.Store) *mcp.Server {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "read_note",
+		Name:        "read_note",
 		Description: "Read a single markdown note. Example: read_note({path: \"network/opnsense/wan-failover.md\", include_frontmatter: true}). Large notes may be truncated at 100 KiB.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in readNoteIn) (*mcp.CallToolResult, readNoteOut, error) {
 		include := true
@@ -129,7 +131,7 @@ func newMCPServer(store *vault.Store) *mcp.Server {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "search_notes",
+		Name:        "search_notes",
 		Description: "Full-text search across markdown notes (stateless scan). Example: search_notes({query: \"opnsense deco\", path_prefix: \"network\", limit: 20}). Space-separated terms are ANDed. Returns [{path, line, snippet, match_count, score}].",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in searchNotesIn) (*mcp.CallToolResult, searchNotesOut, error) {
 		hits, err := store.SearchNotes(vault.SearchParams{
@@ -145,7 +147,108 @@ func newMCPServer(store *vault.Store) *mcp.Server {
 		return nil, searchNotesOut{Results: hits}, nil
 	})
 
+	if !store.ReadOnly {
+		mcp.AddTool(s, &mcp.Tool{
+			Name:        "create_note",
+			Description: "Create a markdown note inside a wiki. Example: create_note({path: \"network/opnsense/new-topic.md\", content: \"# Title\\n\\nBody\", overwrite: false}). Fails if the file exists unless overwrite is true.",
+		}, func(ctx context.Context, req *mcp.CallToolRequest, in createNoteIn) (*mcp.CallToolResult, vault.WriteResult, error) {
+			start := time.Now()
+			res, err := store.CreateNote(in.Path, in.Content, in.Overwrite)
+			var commit string
+			if res != nil {
+				commit = res.Commit
+			}
+			logTool("create_note", []string{in.Path}, start, err, commit, resBytes(res))
+			if err != nil {
+				return nil, vault.WriteResult{}, err
+			}
+			return nil, *res, nil
+		})
+
+		mcp.AddTool(s, &mcp.Tool{
+			Name:        "update_note",
+			Description: "Update a note. Prefer patch mode. Example: update_note({path: \"network/opnsense/wan-failover.md\", mode: \"patch\", old_str: \"## Old\", new_str: \"## New\\n\\nDetails\"}). Modes: patch, append, prepend, replace.",
+		}, func(ctx context.Context, req *mcp.CallToolRequest, in updateNoteIn) (*mcp.CallToolResult, updateNoteOut, error) {
+			start := time.Now()
+			res, err := store.UpdateNote(in.Path, in.Mode, in.OldStr, in.NewStr, in.Content)
+			var commit string
+			var bytes int64
+			if res != nil {
+				commit = res.Commit
+				bytes = res.BytesWritten
+			}
+			logTool("update_note", []string{in.Path}, start, err, commit, bytes)
+			if err != nil {
+				return nil, updateNoteOut{}, err
+			}
+			return nil, updateNoteOut{Path: res.Path, Mode: in.Mode, Commit: res.Commit, BytesWritten: res.BytesWritten}, nil
+		})
+
+		mcp.AddTool(s, &mcp.Tool{
+			Name:        "delete_note",
+			Description: "Soft-delete a note (git-recoverable). Example: delete_note({path: \"network/opnsense/old.md\", confirm: true}). confirm must be true.",
+		}, func(ctx context.Context, req *mcp.CallToolRequest, in deleteNoteIn) (*mcp.CallToolResult, vault.DeleteResult, error) {
+			if !in.Confirm {
+				return nil, vault.DeleteResult{}, fmt.Errorf("confirm must be true")
+			}
+			start := time.Now()
+			res, err := store.DeleteNote(in.Path)
+			var commit string
+			if res != nil {
+				commit = res.Commit
+			}
+			logTool("delete_note", []string{in.Path}, start, err, commit, 0)
+			if err != nil {
+				return nil, vault.DeleteResult{}, err
+			}
+			return nil, *res, nil
+		})
+
+		mcp.AddTool(s, &mcp.Tool{
+			Name:        "move_note",
+			Description: "Rename or move a note. Does not rewrite wikilinks. Example: move_note({from: \"network/old.md\", to: \"network/archive/old.md\", overwrite: false}).",
+		}, func(ctx context.Context, req *mcp.CallToolRequest, in moveNoteIn) (*mcp.CallToolResult, vault.MoveResult, error) {
+			start := time.Now()
+			res, err := store.MoveNote(in.From, in.To, in.Overwrite)
+			var commit string
+			if res != nil {
+				commit = res.Commit
+			}
+			logTool("move_note", []string{in.From, in.To}, start, err, commit, 0)
+			if err != nil {
+				return nil, vault.MoveResult{}, err
+			}
+			return nil, *res, nil
+		})
+	}
+
 	return s
+}
+
+func resBytes(res *vault.WriteResult) int64 {
+	if res == nil {
+		return 0
+	}
+	return res.BytesWritten
+}
+
+func logTool(tool string, paths []string, start time.Time, err error, commit string, bytes int64) {
+	attrs := []any{
+		"tool", tool,
+		"paths", paths,
+		"duration_ms", time.Since(start).Milliseconds(),
+	}
+	if err != nil {
+		slog.Warn("tool call", append(attrs, "result", "error", "err", err.Error())...)
+		return
+	}
+	if commit != "" {
+		attrs = append(attrs, "commit", commit)
+	}
+	if bytes > 0 {
+		attrs = append(attrs, "bytes", bytes)
+	}
+	slog.Info("tool call", append(attrs, "result", "ok")...)
 }
 
 type listWikisOut struct {
@@ -189,7 +292,39 @@ type searchNotesOut struct {
 	Results []vault.SearchHit `json:"results"`
 }
 
-func NewStore(root string, ignore []string, maxNoteBytes int64) (*vault.Store, error) {
+type createNoteIn struct {
+	Path      string `json:"path" jsonschema:"Root-relative path ending in .md"`
+	Content   string `json:"content" jsonschema:"Full note content"`
+	Overwrite bool   `json:"overwrite,omitempty" jsonschema:"Overwrite if the file already exists"`
+}
+
+type updateNoteIn struct {
+	Path    string `json:"path" jsonschema:"Root-relative path to the note"`
+	Mode    string `json:"mode" jsonschema:"patch, append, prepend, or replace"`
+	OldStr  string `json:"old_str,omitempty" jsonschema:"String to replace (patch mode; must be unique)"`
+	NewStr  string `json:"new_str,omitempty" jsonschema:"Replacement string (patch mode)"`
+	Content string `json:"content,omitempty" jsonschema:"Content for append, prepend, or replace modes"`
+}
+
+type updateNoteOut struct {
+	Path         string `json:"path"`
+	Mode         string `json:"mode"`
+	Commit       string `json:"commit,omitempty"`
+	BytesWritten int64  `json:"bytes_written"`
+}
+
+type deleteNoteIn struct {
+	Path    string `json:"path" jsonschema:"Root-relative path to delete"`
+	Confirm bool   `json:"confirm" jsonschema:"Must be true to confirm deletion"`
+}
+
+type moveNoteIn struct {
+	From      string `json:"from" jsonschema:"Source path"`
+	To        string `json:"to" jsonschema:"Destination path"`
+	Overwrite bool   `json:"overwrite,omitempty" jsonschema:"Overwrite destination if it exists"`
+}
+
+func NewStore(root string, ignore []string, maxNoteBytes int64, gitRepo *git.Repo, readOnly bool) (*vault.Store, error) {
 	pv, err := paths.NewVault(root, ignore)
 	if err != nil {
 		return nil, err
@@ -198,6 +333,8 @@ func NewStore(root string, ignore []string, maxNoteBytes int64) (*vault.Store, e
 		Paths:          pv,
 		MaxNoteBytes:   maxNoteBytes,
 		ReadLimitBytes: vault.DefaultReadLimit,
+		Git:            gitRepo,
+		ReadOnly:       readOnly,
 	}, nil
 }
 

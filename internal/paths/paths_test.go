@@ -33,7 +33,7 @@ func TestResolveRejectsAbsolutePath(t *testing.T) {
 
 func TestResolveRejectsExcludedDirs(t *testing.T) {
 	root := t.TempDir()
-	for _, dir := range []string{".git", ".obsidian", ".trash"} {
+	for _, dir := range []string{".git", ".obsidian", ".trash", ".claude"} {
 		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -42,7 +42,7 @@ func TestResolveRejectsExcludedDirs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range []string{".git/config", ".obsidian/workspace", ".trash/note.md", "wiki/.git/x"} {
+	for _, p := range []string{".git/config", ".obsidian/workspace", ".trash/note.md", ".claude/settings.md", "wiki/.git/x"} {
 		if _, err := v.Resolve(p); err == nil {
 			t.Fatalf("Resolve(%q) should fail", p)
 		}

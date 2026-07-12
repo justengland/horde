@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/justengland/horde/internal/git"
 	"github.com/justengland/horde/internal/paths"
 )
 
@@ -26,13 +27,15 @@ type Store struct {
 	Paths          *paths.Vault
 	MaxNoteBytes   int64
 	ReadLimitBytes int64
+	Git            *git.Repo
+	ReadOnly       bool
 }
 
 type WikiInfo struct {
-	Name         string    `json:"name"`
-	NoteCount    int       `json:"note_count"`
-	HasTaxonomy  bool      `json:"has_taxonomy"`
-	Modified     time.Time `json:"modified"`
+	Name        string    `json:"name"`
+	NoteCount   int       `json:"note_count"`
+	HasTaxonomy bool      `json:"has_taxonomy"`
+	Modified    time.Time `json:"modified"`
 }
 
 type NoteMeta struct {
@@ -42,13 +45,13 @@ type NoteMeta struct {
 }
 
 type NoteRead struct {
-	Path            string         `json:"path"`
-	Frontmatter     map[string]any `json:"frontmatter,omitempty"`
-	Body            string         `json:"body"`
-	Size            int64          `json:"size"`
-	Modified        time.Time      `json:"modified"`
-	Truncated       bool           `json:"truncated,omitempty"`
-	IncludeFrontmatter bool        `json:"-"`
+	Path               string         `json:"path"`
+	Frontmatter        map[string]any `json:"frontmatter,omitempty"`
+	Body               string         `json:"body"`
+	Size               int64          `json:"size"`
+	Modified           time.Time      `json:"modified"`
+	Truncated          bool           `json:"truncated,omitempty"`
+	IncludeFrontmatter bool           `json:"-"`
 }
 
 type SearchHit struct {
@@ -218,10 +221,10 @@ func (s *Store) ReadNote(apiPath string, includeFrontmatter bool) (*NoteRead, er
 		truncated = true
 	}
 	out := &NoteRead{
-		Path:     apiPath,
-		Size:     info.Size(),
-		Modified: info.ModTime(),
-		Truncated: truncated,
+		Path:               apiPath,
+		Size:               info.Size(),
+		Modified:           info.ModTime(),
+		Truncated:          truncated,
 		IncludeFrontmatter: includeFrontmatter,
 	}
 	if includeFrontmatter {
@@ -487,18 +490,4 @@ func firstSnippet(content string, terms []string, re *regexp.Regexp, caseSensiti
 		return lineNo + 1, snippet
 	}
 	return 0, ""
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

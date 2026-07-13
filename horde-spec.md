@@ -162,6 +162,7 @@ Descriptions ship in the binary and matter as much as code. Requirements: state 
 | `HORDE_ROOT` | `~/Documents/Obsidian` | Root containing wiki folders |
 | `HORDE_TOKEN` | — (required) | Bearer token |
 | `HORDE_ADDR` | `127.0.0.1:8787` | Listen address |
+| `HORDE_PUBLIC_URL` | — | External base URL; enables OAuth endpoints (§4) |
 | `HORDE_READONLY` | `0` | Disable all mutating tools |
 | `HORDE_GIT` | `on` | `on|off` |
 | `HORDE_GIT_PUSH` | `0` | Async push after commit |

@@ -15,11 +15,12 @@ import (
 	"github.com/justengland/horde/internal/git"
 	"github.com/justengland/horde/internal/oauth"
 	"github.com/justengland/horde/internal/paths"
+	"github.com/justengland/horde/internal/render"
 	"github.com/justengland/horde/internal/vault"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const Version = "0.5.0-m5.1"
+const Version = "0.6.0-m6"
 
 const Instructions = "Before creating or editing notes in a wiki, read `<wiki>/taxonomy.md` and follow it. If it does not exist, propose one using `create_note` before making other changes. Paths are root-relative with forward slashes and must begin with a wiki name (e.g. `network/opnsense/wan-failover.md`). Prefer `update_note` patch mode over replace. Deletes are git-recoverable. `move_note` does not rewrite wikilinks. IMPORTANT: To find or view images/PDFs, call `list_attachments` then `read_attachment` (or resources/read on the returned wiki:// URI). `list_notes` / `search_notes` / `read_note` only cover markdown — they never list or return binary files, even when a note embeds `![[photo.png]]`. Attachments are read-only."
 
@@ -32,7 +33,14 @@ type Deps struct {
 }
 
 func NewHTTPServer(deps Deps) http.Handler {
-	mcpServer := newMCPServer(deps.Store)
+	// Render Links (ADR-10) exist only when there is a public base URL to
+	// mint against; the signing secret is boot-generated, so a restart
+	// revokes every outstanding link.
+	var signer *render.Signer
+	if deps.PublicURL != "" {
+		signer = render.NewSigner(deps.PublicURL)
+	}
+	mcpServer := newMCPServer(deps.Store, signer)
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
 		return mcpServer
 	}, nil)
@@ -46,6 +54,7 @@ func NewHTTPServer(deps Deps) http.Handler {
 		oa := oauth.New(deps.PublicURL, deps.Token)
 		oa.Register(mux)
 		metadataURL = oa.ResourceMetadataURL()
+		mux.HandleFunc("GET /render/{path...}", handleRender(deps.Store, signer))
 	}
 	mux.Handle("/mcp", auth.BearerMiddlewareWithMetadata(deps.Token, metadataURL, mcpHandler))
 
@@ -82,7 +91,9 @@ func CheckGitRepo(root string) error {
 	return fmt.Errorf("%s is not a git repository (set HORDE_GIT=off to disable)", root)
 }
 
-func newMCPServer(store *vault.Store) *mcp.Server {
+// newMCPServer builds the MCP surface. signer is nil when no public URL is
+// configured; attachment tools then omit the url field.
+func newMCPServer(store *vault.Store, signer *render.Signer) *mcp.Server {
 	s := mcp.NewServer(&mcp.Implementation{
 		Name:    "horde",
 		Version: Version,
@@ -191,32 +202,42 @@ func newMCPServer(store *vault.Store) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "list_attachments",
-		Description: "REQUIRED to discover images/PDFs — list_notes and search_notes skip binaries. Enumerate allowlisted attachments (png/jpg/jpeg/gif/webp/pdf by default) under a path prefix. Example: list_attachments({path_prefix: \"Pegasus\"}) → [{uri, path, name, mime_type, size, modified}]. Then call read_attachment with path, or resources/read on the returned wiki:// URI (URIs are percent-encoded). Size cap via HORDE_MAX_ATTACHMENT_BYTES.",
+		Description: "REQUIRED to discover images/PDFs — list_notes and search_notes skip binaries. Enumerate allowlisted attachments (png/jpg/jpeg/gif/webp/pdf by default) under a path prefix. Example: list_attachments({path_prefix: \"Pegasus\"}) → [{uri, path, name, mime_type, size, modified, url}]. Then call read_attachment with path, or resources/read on the returned wiki:// URI (URIs are percent-encoded). url, when present, is a short-lived Render Link (~6 h) for displaying the attachment inline in chat — not a permalink or share link. Size cap via HORDE_MAX_ATTACHMENT_BYTES.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in listAttachmentsIn) (*mcp.CallToolResult, listAttachmentsOut, error) {
 		atts, err := store.ListAttachments(in.PathPrefix, in.Limit)
 		if err != nil {
 			return nil, listAttachmentsOut{}, err
 		}
-		return nil, listAttachmentsOut{Attachments: atts}, nil
+		out := make([]attachmentMetaOut, len(atts))
+		for i, att := range atts {
+			out[i] = attachmentMetaOut{AttachmentMeta: att}
+			if signer != nil {
+				out[i].URL = signer.Mint(att.Path)
+			}
+		}
+		return nil, listAttachmentsOut{Attachments: out}, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "read_attachment",
-		Description: "Fetch an allowlisted attachment (read-only). Example: read_attachment({path: \"Pegasus/90 Assets/Photos/pegasus.png\"}) or a wiki:// URI from list_attachments. Prefer the path field from list_attachments. Returns image content (for image/*) plus mime_type/path metadata. Rejects disallowed extensions, excluded dirs, and files over HORDE_MAX_ATTACHMENT_BYTES. Does not write binaries.",
+		Description: "Fetch an allowlisted attachment (read-only). Example: read_attachment({path: \"Pegasus/90 Assets/Photos/pegasus.png\"}) or a wiki:// URI from list_attachments. Prefer the path field from list_attachments. Returns image content (for image/*) plus mime_type/path metadata. url, when present, is a short-lived Render Link (~6 h) for displaying the attachment inline in chat — not a permalink or share link. Rejects disallowed extensions, excluded dirs, and files over HORDE_MAX_ATTACHMENT_BYTES. Does not write binaries.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in readAttachmentIn) (*mcp.CallToolResult, readAttachmentOut, error) {
 		att, err := store.ReadAttachment(in.Path)
 		if err != nil {
 			return nil, readAttachmentOut{}, err
 		}
-		content := attachmentContent(att)
+		out := readAttachmentOut{
+			URI:      att.URI,
+			Path:     att.Path,
+			MIMEType: att.MIMEType,
+			Size:     att.Size,
+		}
+		if signer != nil {
+			out.URL = signer.Mint(att.Path)
+		}
 		return &mcp.CallToolResult{
-				Content: content,
-			}, readAttachmentOut{
-				URI:      att.URI,
-				Path:     att.Path,
-				MIMEType: att.MIMEType,
-				Size:     att.Size,
-			}, nil
+			Content: attachmentContent(att),
+		}, out, nil
 	})
 
 	// Preferred fetch path: MCP resources with wiki:// URIs.
@@ -430,8 +451,15 @@ type listAttachmentsIn struct {
 	Limit      int    `json:"limit,omitempty" jsonschema:"Maximum attachments to return"`
 }
 
+// attachmentMetaOut adds the Render Link (ADR-10) to the vault metadata;
+// URL is empty (and omitted) when HORDE_PUBLIC_URL is not set.
+type attachmentMetaOut struct {
+	vault.AttachmentMeta
+	URL string `json:"url,omitempty"`
+}
+
 type listAttachmentsOut struct {
-	Attachments []vault.AttachmentMeta `json:"attachments"`
+	Attachments []attachmentMetaOut `json:"attachments"`
 }
 
 type readAttachmentIn struct {
@@ -443,6 +471,7 @@ type readAttachmentOut struct {
 	Path     string `json:"path"`
 	MIMEType string `json:"mime_type"`
 	Size     int64  `json:"size"`
+	URL      string `json:"url,omitempty"`
 }
 
 // attachmentContent prefers MCP image content for image/* so Claude connectors

@@ -1,6 +1,6 @@
 # horde — Obsidian Vault MCP Server (Go)
 
-**Status:** v1.5 · M5 complete (link_graph + attachments) · updated 2026-07-12
+**Status:** v1.6 · M6 complete (render links) · updated 2026-07-13
 **Owner:** Justin
 **Goal:** Expose an Obsidian vault (plain markdown directory) as a remote MCP server so Claude.ai / Claude mobile can read, search, create, edit, and delete notes, with git as the safety net.
 
@@ -23,7 +23,7 @@ horde (Go, Docker; host-published on 127.0.0.1:8787)  ── validates bearer to
 ~/Documents/Obsidian  (git repo; sole copy — replicated only via git hub + rclone)
 ```
 
-Non-goals for v1: multi-vault support, multi-user auth, wikilink graph analysis, attachment/binary serving, Obsidian plugin/UI features (canvas rendering, dataview execution). Graph + read-only attachments land in v1.5 (§7, §14); canvas rendering and dataview stay out of scope.
+Non-goals for v1: multi-vault support, multi-user auth, wikilink graph analysis, attachment/binary serving, Obsidian plugin/UI features (canvas rendering, dataview execution). Graph + read-only attachments land in v1.5 (§7, §14); signed render links land in v1.6 (§7, ADR-10); canvas rendering and dataview stay out of scope.
 
 ## 2. Stack & Dependencies
 
@@ -43,7 +43,7 @@ Non-goals for v1: multi-vault support, multi-user auth, wikilink graph analysis,
 - `GET /healthz` — liveness: returns vault path readable, git repo OK, version. Unauthenticated by design.
 - OAuth 2.1 endpoints (enabled when `HORDE_PUBLIC_URL` is set; see §4): `/.well-known/oauth-protected-resource[/mcp]`, `/.well-known/oauth-authorization-server`, `/oauth/register`, `/oauth/authorize`, `/oauth/token`.
 - Binding: inside the container horde binds `0.0.0.0:8787` so the cloudflared sidecar can reach it over the compose network; the host port is published on `127.0.0.1` only. Nothing listens on LAN/WAN.
-- No public static-file / attachment HTTP routes — binaries are MCP-only when v1.5 lands (§7).
+- Exactly one public-but-signed attachment route (v1.6, ADR-10): `GET /render/{path}?exp=<unix>&sig=<hmac>` serves Render Links minted by the attachment tools. No other static-file routes; every other fetch path stays MCP-only behind the bearer/OAuth gate (§7).
 - Session handling per SDK defaults; server is effectively stateless between calls (no in-memory vault index in v1).
 
 ## 4. Authentication
@@ -69,7 +69,7 @@ Two independent layers; both must pass.
 - A `list_wikis` tool (see §7) enumerates top-level wikis with note counts and whether a `taxonomy.md` exists, so Claude can orient in one call.
 - **Writable extensions:** `.md` only — through v1.5 and beyond unless explicitly revisited. No binary writes via horde.
 - **Readable notes (v1):** `.md` fully; `.canvas` read-only as text/JSON (no canvas rendering).
-- **Readable attachments (v1.5):** allowlisted binaries (images, PDF, etc.) via MCP resources / `read_attachment` only — see §7. Note tools (`list_notes`, `search_notes`, `read_note`) stay markdown-focused; they do not return attachment bytes.
+- **Readable attachments (v1.5):** allowlisted binaries (images, PDF, etc.) via MCP resources / `read_attachment` — see §7. v1.6 adds Render Links: short-lived signed URLs on the same attachments for inline display in chat clients (§7, ADR-10). Note tools (`list_notes`, `search_notes`, `read_note`) stay markdown-focused; they do not return attachment bytes.
 - **Excluded from all operations:** `.obsidian/`, `.git/`, `.trash/`, loose files at the root itself (notes must live inside a wiki), plus configurable ignore globs.
 - Paths in the API are always root-relative with forward slashes and must begin with a wiki name (`network/opnsense/wan-failover.md`).
 - Frontmatter is parsed when present and returned as structured data alongside body content.
@@ -167,7 +167,7 @@ Parse `[[wikilinks]]` across one wiki and return the adjacency map without the a
 
 **Transport shape (preferred):** MCP **resources** with `wiki://` URIs (e.g. `wiki://network/diagrams/wan.png`). Clients that support resources can discover and fetch without a bespoke tool. **Fallback:** a `read_attachment` tool with the same safety rules if Claude connectors prove awkward with resources. Implement one path first; do not ship both indefinitely without a reason.
 
-**No HTTP static files.** Attachments are not served at `/files/…` or similar. Fetch is MCP-only (same auth as tools). Keeps the attack surface inside the existing bearer/OAuth gate and avoids accidental public object storage.
+**HTTP surface (amended by ADR-10, 2026-07-13).** v1.5 shipped fetch as MCP-only — no static files, everything behind the bearer/OAuth gate. That held until a client limitation surfaced: claude.ai does not render `ImageContent` blocks from connector tool results, so image-bearing notes stay invisible in chat. v1.6 adds exactly one HTTP route as a render helper — **Render Links**: when `HORDE_PUBLIC_URL` is set, `list_attachments` / `read_attachment` include a `url` field, an HMAC-signed link (`GET /render/{path}?exp=<unix>&sig=<hmac>`) expiring ~6 hours after minting. The route serves precisely what `read_attachment` serves — same allowlist, size cap, and path safety — and sends `Cache-Control: private, no-store` so Cloudflare's edge cache can't outlive expiry. The signing secret is generated at boot; a restart revokes every outstanding link. Links live only in chat responses (stale images in old conversations are accepted); this is not a file server, not a share feature, and attachments are still never served unsigned.
 
 #### Discovery
 - **Resources list** (or `list_attachments` if tool-shaped): enumerate allowlisted files under an optional `path_prefix` / wiki, returning `{uri|path, name, mime_type, size, modified}`.
@@ -194,14 +194,14 @@ Configurable via `HORDE_ATTACHMENT_EXTS` (comma-sep extensions, no dots). Adding
 - **No binary writes** — create/update/delete/move stay `.md`-only; attachments remain Obsidian/human-side (and rclone-backed).
 - **No canvas rendering** — `.canvas` stays readable as text only; horde does not rasterize or interpret canvas graphs.
 - **No Obsidian plugin features** — no dataview, no embed resolution beyond "here are the bytes at this path", no vault-wide media library UI.
-- **No public CDN / cache headers / range requests** in v1.5 — whole-object fetch under the size cap is enough.
+- **No CDN / range requests** — whole-object fetch under the size cap is enough. (The v1.6 render route sets `Cache-Control: no-store`, but that is leak control, not a caching feature.)
 
 ### Deferred (v2)
 `update_links_on_move`, `daily_note`, vault-wide `replace_all`. (Attachment/`wiki://` resources moved to v1.5 above.)
 
 ## 8. Tool Descriptions (prompt surface)
 
-Descriptions ship in the binary and matter as much as code. Requirements: state path conventions (root-relative, must start with a wiki name), state that `patch` is preferred over `replace`, state that deletes are git-recoverable, and state that `move_note` doesn't fix links. Include one example call per tool in the description. For v1.5 attachment resources / `read_attachment`, state the allowlist, size cap, read-only nature, and that note tools do not return binary bytes.
+Descriptions ship in the binary and matter as much as code. Requirements: state path conventions (root-relative, must start with a wiki name), state that `patch` is preferred over `replace`, state that deletes are git-recoverable, and state that `move_note` doesn't fix links. Include one example call per tool in the description. For v1.5 attachment resources / `read_attachment`, state the allowlist, size cap, read-only nature, and that note tools do not return binary bytes. For v1.6, state that `url` is a short-lived Render Link (~6 h) for inline display only — not a permalink or share link.
 
 ## 9. Configuration
 
@@ -210,7 +210,7 @@ Descriptions ship in the binary and matter as much as code. Requirements: state 
 | `HORDE_ROOT` | `~/Documents/Obsidian` | Root containing wiki folders |
 | `HORDE_TOKEN` | — (required) | Bearer token |
 | `HORDE_ADDR` | `127.0.0.1:8787` | Listen address |
-| `HORDE_PUBLIC_URL` | — | External base URL; enables OAuth endpoints (§4) |
+| `HORDE_PUBLIC_URL` | — | External base URL; enables OAuth endpoints (§4) and Render Links (§7, v1.6) |
 | `HORDE_READONLY` | `0` | Disable all mutating tools |
 | `HORDE_GIT` | `on` | `on|off` |
 | `HORDE_GIT_PUSH` | `0` | Async push after commit |
@@ -218,6 +218,8 @@ Descriptions ship in the binary and matter as much as code. Requirements: state 
 | `HORDE_MAX_NOTE_BYTES` | `2097152` | Write size cap |
 | `HORDE_MAX_ATTACHMENT_BYTES` | `5242880` | Read size cap for attachments (v1.5) |
 | `HORDE_ATTACHMENT_EXTS` | `png,jpg,jpeg,gif,webp,pdf` | Allowlisted attachment extensions (v1.5) |
+
+Render Links (v1.6) deliberately add no config: the TTL is a fixed ~6 h and the signing secret is generated at boot (a restart revokes all outstanding links) — see ADR-10.
 
 ## 10. Observability
 
@@ -238,6 +240,7 @@ Descriptions ship in the binary and matter as much as code. Requirements: state 
 1. ~~**Request-header beta availability.**~~ **Resolved 2026-07-12:** header auth was indeed unavailable; the OAuth 2.1 fallback was implemented in horde itself (§4, ADR-9) and verified end-to-end from claude.ai.
 2. **Concurrent interactive edits** (Obsidian save racing a horde write on the same file): atomic rename limits damage to last-write-wins on whole-file content; accepted for v1 per ADR-5's residual-risk note.
 4. **Rate/abuse:** single-user, token-gated; no rate limiting in v1 beyond Cloudflare defaults.
+5. **Render-link leakage (v1.6):** a leaked URL exposes one attachment for at most ~6 h; accepted per ADR-10. Emergency revocation = restart horde (regenerates the signing secret).
 
 ## 13. Continuous Improvement Loop
 
@@ -262,6 +265,7 @@ The system is designed to compound, not just persist. Three loops, smallest to l
 - ✅ **M3 — Exposure (done 2026-07-12):** docker compose + cloudflared tunnel, OAuth 2.1 connector auth (replaced the WAF-header plan, §4), custom connector live on claude.ai, `hello` tool as a vault-free connectivity check. Outstanding from the original scope: WAF rule (now optional hardening, must be `/mcp`-scoped) and the Claude-mobile end-to-end pass.
 - ✅ **M4 — Polish (done 2026-07-12):** `read_note` offset/length paging, conflict-marker detection on read and write, `history`/`restore` tools, async push via `HORDE_GIT_PUSH`.
 - ✅ **M5 / v1.5 — Graph + attachments (done 2026-07-12):** `link_graph` for lint at scale; read-only attachment serving via MCP resources (`wiki://`) and `list_attachments` / `read_attachment` — allowlisted types, correct MIME, size cap, path safety under `HORDE_ROOT`; no binary writes; no HTTP static file endpoint. Config: `HORDE_MAX_ATTACHMENT_BYTES`, `HORDE_ATTACHMENT_EXTS`.
+- ✅ **M6 / v1.6 — Render Links (done 2026-07-13):** `url` field on `list_attachments` / `read_attachment` (when `HORDE_PUBLIC_URL` is set) + the signed `GET /render/{path}` route (ADR-10). Same allowlist / cap / path safety as `read_attachment`; boot-generated HMAC secret; ~6 h expiry; `Cache-Control: private, no-store`. Outstanding: the claude.ai inline-display pass needs the live deploy to verify.
 - Deferred **v2:** `update_links_on_move`, `daily_note`, vault-wide `replace_all` (see §7).
 
 ## 15. Acceptance Criteria
@@ -275,7 +279,13 @@ The system is designed to compound, not just persist. Three loops, smallest to l
 - Claude (or MCP Inspector) can discover an allowlisted image/PDF under a wiki and fetch its bytes with the correct MIME, gated by the same auth as tools.
 - Paths outside `HORDE_ROOT`, disallowed extensions, excluded dirs, and oversize files are rejected; binary write tools do not exist.
 - `list_notes` / `search_notes` still skip non-`.md`; attachment discovery does not require changing note-tool semantics.
-- No unauthenticated HTTP route serves vault binaries.
+- No unauthenticated HTTP route serves vault binaries. (v1.6 narrows this to: no *unsigned* route — Render Links are the sole, signature-gated exception; see ADR-10.)
+
+### v1.6 additions
+- With `HORDE_PUBLIC_URL` set, `list_attachments` / `read_attachment` return a `url`; pasting it into a browser fetches the file with correct MIME until expiry.
+- The same URL after expiry — or after a horde restart — returns an error, including through Cloudflare (no cached body served).
+- A tampered path, expiry, or signature is rejected; disallowed extensions and excluded dirs are never signed and never served.
+- An image embedded via its Render Link displays inline in a claude.ai conversation.
 
 ## 16. Decision Log (ADRs)
 
@@ -316,3 +326,8 @@ The system is designed to compound, not just persist. Three loops, smallest to l
 **Context:** claude.ai custom connectors turned out to require the OAuth handshake — the request-header option from §4's original plan was not offered (risk §12.1 materialized).
 **Decision:** Implement the minimal single-user OAuth 2.1 flow inside horde (`internal/oauth`) rather than fronting it with a proxy: discovery metadata (RFC 9728 + 8414), dynamic client registration, authorization code + PKCE (S256). The "login" is pasting `HORDE_TOKEN` into horde's authorize page, and the issued access token **is** `HORDE_TOKEN` — the bearer middleware is untouched, tokens survive restarts, and there is exactly one credential in the system.
 **Consequences:** in-memory client registrations are lost on restart; mitigated by allowlisting claude.ai/claude.com callback hosts for unknown client IDs (safe: an attacker-initiated authorize still requires the token and can only redirect to claude.ai). Any future WAF rule must exempt `/oauth/*` and `/.well-known/*`. Token rotation = rotate `HORDE_TOKEN` and reconnect the connector once.
+
+### ADR-10 — Render Links: one signed HTTP route for attachments (2026-07-13)
+**Context:** claude.ai does not render `ImageContent` from connector tool results, so v1.5's MCP-only attachment fetch leaves image-bearing notes invisible in chat.
+**Decision:** Supersede §7's "No HTTP static files" rule with exactly one route: attachment tools mint HMAC-signed, ~6 h-expiring **Render Links** (`GET /render/{path}?exp&sig`) serving precisely what `read_attachment` serves. A render helper for MCP conversations, not a file server. Full record: [docs/adr/0010-render-links-for-attachments.md](docs/adr/0010-render-links-for-attachments.md); glossary: [CONTEXT.md](CONTEXT.md).
+**Consequences:** boot-generated secret (restart = mass revocation, zero secret management); `Cache-Control: no-store` required because of Cloudflare edge caching; if claude.ai ever renders `ImageContent`, the route can be retired.

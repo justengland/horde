@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/justengland/horde/internal/auth"
@@ -18,9 +19,9 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const Version = "0.5.0-m5"
+const Version = "0.5.0-m5.1"
 
-const Instructions = "Before creating or editing notes in a wiki, read `<wiki>/taxonomy.md` and follow it. If it does not exist, propose one using `create_note` before making other changes. Paths are root-relative with forward slashes and must begin with a wiki name (e.g. `network/opnsense/wan-failover.md`). Prefer `update_note` patch mode over replace. Deletes are git-recoverable. `move_note` does not rewrite wikilinks. Attachments (images/PDFs) are read-only via MCP resources (`wiki://…`) or `list_attachments` / `read_attachment`; note tools never return binary bytes."
+const Instructions = "Before creating or editing notes in a wiki, read `<wiki>/taxonomy.md` and follow it. If it does not exist, propose one using `create_note` before making other changes. Paths are root-relative with forward slashes and must begin with a wiki name (e.g. `network/opnsense/wan-failover.md`). Prefer `update_note` patch mode over replace. Deletes are git-recoverable. `move_note` does not rewrite wikilinks. IMPORTANT: To find or view images/PDFs, call `list_attachments` then `read_attachment` (or resources/read on the returned wiki:// URI). `list_notes` / `search_notes` / `read_note` only cover markdown — they never list or return binary files, even when a note embeds `![[photo.png]]`. Attachments are read-only."
 
 type Deps struct {
 	Store *vault.Store
@@ -109,7 +110,7 @@ func newMCPServer(store *vault.Store) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "list_notes",
-		Description: "List markdown notes under a path prefix. Example: list_notes({path_prefix: \"network\", recursive: true, sort: \"modified\", limit: 50}). Returns [{path, size, modified}] with root-relative paths.",
+		Description: "List markdown notes under a path prefix (skips images/PDFs — use list_attachments for those). Example: list_notes({path_prefix: \"network\", recursive: true, sort: \"modified\", limit: 50}). Returns [{path, size, modified}] with root-relative paths.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in listNotesIn) (*mcp.CallToolResult, listNotesOut, error) {
 		recursive := true
 		if in.Recursive != nil {
@@ -151,7 +152,7 @@ func newMCPServer(store *vault.Store) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "search_notes",
-		Description: "Full-text search across markdown notes (stateless scan). Example: search_notes({query: \"opnsense deco\", path_prefix: \"network\", limit: 20}). Space-separated terms are ANDed. Returns [{path, line, snippet, match_count, score}].",
+		Description: "Full-text search across markdown notes only (does not search image filenames or binary content — use list_attachments). Example: search_notes({query: \"opnsense deco\", path_prefix: \"network\", limit: 20}). Space-separated terms are ANDed. Returns [{path, line, snippet, match_count, score}].",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in searchNotesIn) (*mcp.CallToolResult, searchNotesOut, error) {
 		hits, err := store.SearchNotes(vault.SearchParams{
 			Query:         in.Query,
@@ -190,7 +191,7 @@ func newMCPServer(store *vault.Store) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "list_attachments",
-		Description: "Discover allowlisted read-only attachments (png/jpg/jpeg/gif/webp/pdf by default) under a path prefix. Example: list_attachments({path_prefix: \"network\"}) → [{uri, path, name, mime_type, size, modified}]. Note tools skip binaries; use read_attachment or resources/read on the wiki:// URI to fetch bytes. Size cap via HORDE_MAX_ATTACHMENT_BYTES.",
+		Description: "REQUIRED to discover images/PDFs — list_notes and search_notes skip binaries. Enumerate allowlisted attachments (png/jpg/jpeg/gif/webp/pdf by default) under a path prefix. Example: list_attachments({path_prefix: \"Pegasus\"}) → [{uri, path, name, mime_type, size, modified}]. Then call read_attachment with path, or resources/read on the returned wiki:// URI (URIs are percent-encoded). Size cap via HORDE_MAX_ATTACHMENT_BYTES.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in listAttachmentsIn) (*mcp.CallToolResult, listAttachmentsOut, error) {
 		atts, err := store.ListAttachments(in.PathPrefix, in.Limit)
 		if err != nil {
@@ -201,22 +202,15 @@ func newMCPServer(store *vault.Store) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "read_attachment",
-		Description: "Fetch raw bytes of an allowlisted attachment (read-only). Example: read_attachment({path: \"network/diagrams/wan.png\"}) or path \"wiki://network/diagrams/wan.png\". Returns mime_type plus embedded resource blob. Rejects disallowed extensions, excluded dirs, and files over HORDE_MAX_ATTACHMENT_BYTES. Does not write binaries.",
+		Description: "Fetch an allowlisted attachment (read-only). Example: read_attachment({path: \"Pegasus/90 Assets/Photos/pegasus.png\"}) or a wiki:// URI from list_attachments. Prefer the path field from list_attachments. Returns image content (for image/*) plus mime_type/path metadata. Rejects disallowed extensions, excluded dirs, and files over HORDE_MAX_ATTACHMENT_BYTES. Does not write binaries.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in readAttachmentIn) (*mcp.CallToolResult, readAttachmentOut, error) {
 		att, err := store.ReadAttachment(in.Path)
 		if err != nil {
 			return nil, readAttachmentOut{}, err
 		}
+		content := attachmentContent(att)
 		return &mcp.CallToolResult{
-				Content: []mcp.Content{
-					&mcp.EmbeddedResource{
-						Resource: &mcp.ResourceContents{
-							URI:      att.URI,
-							MIMEType: att.MIMEType,
-							Blob:     att.Bytes,
-						},
-					},
-				},
+				Content: content,
 			}, readAttachmentOut{
 				URI:      att.URI,
 				Path:     att.Path,
@@ -449,6 +443,25 @@ type readAttachmentOut struct {
 	Path     string `json:"path"`
 	MIMEType string `json:"mime_type"`
 	Size     int64  `json:"size"`
+}
+
+// attachmentContent prefers MCP image content for image/* so Claude connectors
+// can display bytes; other allowlisted types stay as embedded resources.
+func attachmentContent(att *vault.AttachmentRead) []mcp.Content {
+	if strings.HasPrefix(att.MIMEType, "image/") {
+		return []mcp.Content{
+			&mcp.ImageContent{Data: att.Bytes, MIMEType: att.MIMEType},
+		}
+	}
+	return []mcp.Content{
+		&mcp.EmbeddedResource{
+			Resource: &mcp.ResourceContents{
+				URI:      att.URI,
+				MIMEType: att.MIMEType,
+				Blob:     att.Bytes,
+			},
+		},
+	}
 }
 
 type restoreIn struct {

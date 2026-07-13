@@ -167,10 +167,20 @@ func AllowedWriteExt(name string) bool {
 }
 
 // WikiURI builds a wiki:// URI from a root-relative vault path.
+// Path segments are percent-encoded so the URI matches MCP resource
+// templates (unencoded spaces/& etc. fail template matching).
 // Example: network/diagrams/wan.png → wiki://network/diagrams/wan.png
+// Example: Pegasus/90 Assets/x.png → wiki://Pegasus/90%20Assets/x.png
 func WikiURI(apiPath string) string {
 	apiPath = strings.Trim(filepath.ToSlash(apiPath), "/")
-	return "wiki://" + apiPath
+	if apiPath == "" {
+		return "wiki://"
+	}
+	parts := strings.Split(apiPath, "/")
+	for i, part := range parts {
+		parts[i] = url.PathEscape(part)
+	}
+	return "wiki://" + strings.Join(parts, "/")
 }
 
 // ParseWikiURI accepts a wiki:// URI or a plain root-relative path and returns

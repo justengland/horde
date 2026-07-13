@@ -18,9 +18,9 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const Version = "0.4.0-m4"
+const Version = "0.5.0-m5"
 
-const Instructions = "Before creating or editing notes in a wiki, read `<wiki>/taxonomy.md` and follow it. If it does not exist, propose one using `create_note` before making other changes. Paths are root-relative with forward slashes and must begin with a wiki name (e.g. `network/opnsense/wan-failover.md`). Prefer `update_note` patch mode over replace. Deletes are git-recoverable. `move_note` does not rewrite wikilinks."
+const Instructions = "Before creating or editing notes in a wiki, read `<wiki>/taxonomy.md` and follow it. If it does not exist, propose one using `create_note` before making other changes. Paths are root-relative with forward slashes and must begin with a wiki name (e.g. `network/opnsense/wan-failover.md`). Prefer `update_note` patch mode over replace. Deletes are git-recoverable. `move_note` does not rewrite wikilinks. Attachments (images/PDFs) are read-only via MCP resources (`wiki://…`) or `list_attachments` / `read_attachment`; note tools never return binary bytes."
 
 type Deps struct {
 	Store *vault.Store
@@ -176,6 +176,76 @@ func newMCPServer(store *vault.Store) *mcp.Server {
 		}
 		return nil, historyOut{Commits: entries}, nil
 	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "link_graph",
+		Description: "Parse [[wikilinks]] across one wiki and return the adjacency map for lint (orphans, broken links). Example: link_graph({wiki: \"network\"}) → {pages: [{path, out_links, in_link_count}], orphans, broken_links}. Does not follow or rewrite links.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in linkGraphIn) (*mcp.CallToolResult, vault.LinkGraph, error) {
+		g, err := store.LinkGraph(in.Wiki)
+		if err != nil {
+			return nil, vault.LinkGraph{}, err
+		}
+		return nil, *g, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "list_attachments",
+		Description: "Discover allowlisted read-only attachments (png/jpg/jpeg/gif/webp/pdf by default) under a path prefix. Example: list_attachments({path_prefix: \"network\"}) → [{uri, path, name, mime_type, size, modified}]. Note tools skip binaries; use read_attachment or resources/read on the wiki:// URI to fetch bytes. Size cap via HORDE_MAX_ATTACHMENT_BYTES.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in listAttachmentsIn) (*mcp.CallToolResult, listAttachmentsOut, error) {
+		atts, err := store.ListAttachments(in.PathPrefix, in.Limit)
+		if err != nil {
+			return nil, listAttachmentsOut{}, err
+		}
+		return nil, listAttachmentsOut{Attachments: atts}, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "read_attachment",
+		Description: "Fetch raw bytes of an allowlisted attachment (read-only). Example: read_attachment({path: \"network/diagrams/wan.png\"}) or path \"wiki://network/diagrams/wan.png\". Returns mime_type plus embedded resource blob. Rejects disallowed extensions, excluded dirs, and files over HORDE_MAX_ATTACHMENT_BYTES. Does not write binaries.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in readAttachmentIn) (*mcp.CallToolResult, readAttachmentOut, error) {
+		att, err := store.ReadAttachment(in.Path)
+		if err != nil {
+			return nil, readAttachmentOut{}, err
+		}
+		return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.EmbeddedResource{
+						Resource: &mcp.ResourceContents{
+							URI:      att.URI,
+							MIMEType: att.MIMEType,
+							Blob:     att.Bytes,
+						},
+					},
+				},
+			}, readAttachmentOut{
+				URI:      att.URI,
+				Path:     att.Path,
+				MIMEType: att.MIMEType,
+				Size:     att.Size,
+			}, nil
+	})
+
+	// Preferred fetch path: MCP resources with wiki:// URIs.
+	readWikiResource := func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		att, err := store.ReadAttachment(req.Params.URI)
+		if err != nil {
+			return nil, err
+		}
+		return &mcp.ReadResourceResult{
+			Contents: []*mcp.ResourceContents{{
+				URI:      att.URI,
+				MIMEType: att.MIMEType,
+				Blob:     att.Bytes,
+			}},
+		}, nil
+	}
+	s.AddResourceTemplate(&mcp.ResourceTemplate{
+		URITemplate: "wiki://{wiki}/{+filepath}",
+		Name:        "vault-attachment",
+		Title:       "Vault attachment",
+		Description: "Read-only allowlisted attachment under HORDE_ROOT. URI example: wiki://network/diagrams/wan.png. Allowlist and size cap from HORDE_ATTACHMENT_EXTS / HORDE_MAX_ATTACHMENT_BYTES. Note tools do not return binary bytes.",
+		MIMEType:    "application/octet-stream",
+	}, readWikiResource)
 
 	if !store.ReadOnly {
 		mcp.AddTool(s, &mcp.Tool{
@@ -357,6 +427,30 @@ type historyOut struct {
 	Commits []git.HistoryEntry `json:"commits"`
 }
 
+type linkGraphIn struct {
+	Wiki string `json:"wiki" jsonschema:"Top-level wiki folder name"`
+}
+
+type listAttachmentsIn struct {
+	PathPrefix string `json:"path_prefix,omitempty" jsonschema:"Root-relative prefix; empty means vault root"`
+	Limit      int    `json:"limit,omitempty" jsonschema:"Maximum attachments to return"`
+}
+
+type listAttachmentsOut struct {
+	Attachments []vault.AttachmentMeta `json:"attachments"`
+}
+
+type readAttachmentIn struct {
+	Path string `json:"path" jsonschema:"Root-relative path or wiki:// URI"`
+}
+
+type readAttachmentOut struct {
+	URI      string `json:"uri"`
+	Path     string `json:"path"`
+	MIMEType string `json:"mime_type"`
+	Size     int64  `json:"size"`
+}
+
 type restoreIn struct {
 	Path string `json:"path" jsonschema:"Root-relative path to restore"`
 	Ref  string `json:"ref" jsonschema:"Git commit hash or ref"`
@@ -394,18 +488,39 @@ type moveNoteIn struct {
 	Overwrite bool   `json:"overwrite,omitempty" jsonschema:"Overwrite destination if it exists"`
 }
 
-func NewStore(root string, ignore []string, maxNoteBytes int64, gitRepo *git.Repo, readOnly bool) (*vault.Store, error) {
-	pv, err := paths.NewVault(root, ignore)
+func NewStore(opts StoreOpts) (*vault.Store, error) {
+	pv, err := paths.NewVault(opts.Root, opts.Ignore)
 	if err != nil {
 		return nil, err
 	}
+	maxNote := opts.MaxNoteBytes
+	if maxNote <= 0 {
+		maxNote = 2 * 1024 * 1024
+	}
+	maxAtt := opts.MaxAttachmentBytes
+	if maxAtt <= 0 {
+		maxAtt = 5 * 1024 * 1024
+	}
 	return &vault.Store{
-		Paths:          pv,
-		MaxNoteBytes:   maxNoteBytes,
-		ReadLimitBytes: vault.DefaultReadLimit,
-		Git:            gitRepo,
-		ReadOnly:       readOnly,
+		Paths:              pv,
+		MaxNoteBytes:       maxNote,
+		MaxAttachmentBytes: maxAtt,
+		AttachmentMIME:     opts.AttachmentMIME,
+		ReadLimitBytes:     vault.DefaultReadLimit,
+		Git:                opts.Git,
+		ReadOnly:           opts.ReadOnly,
 	}, nil
+}
+
+// StoreOpts configures a vault.Store.
+type StoreOpts struct {
+	Root               string
+	Ignore             []string
+	MaxNoteBytes       int64
+	MaxAttachmentBytes int64
+	AttachmentMIME     map[string]string
+	Git                *git.Repo
+	ReadOnly           bool
 }
 
 func EnsureVaultRoot(root string) error {

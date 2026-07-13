@@ -2,6 +2,7 @@ package paths
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -154,7 +155,7 @@ func (v *Vault) checkExcludedComponents(clean string) error {
 	return nil
 }
 
-// AllowedReadExt reports whether extension may be read.
+// AllowedReadExt reports whether extension may be read as a note.
 func AllowedReadExt(name string) bool {
 	ext := strings.ToLower(filepath.Ext(name))
 	return ext == ".md" || ext == ".canvas"
@@ -163,4 +164,41 @@ func AllowedReadExt(name string) bool {
 // AllowedWriteExt reports whether extension may be written (M2).
 func AllowedWriteExt(name string) bool {
 	return strings.ToLower(filepath.Ext(name)) == ".md"
+}
+
+// WikiURI builds a wiki:// URI from a root-relative vault path.
+// Example: network/diagrams/wan.png → wiki://network/diagrams/wan.png
+func WikiURI(apiPath string) string {
+	apiPath = strings.Trim(filepath.ToSlash(apiPath), "/")
+	return "wiki://" + apiPath
+}
+
+// ParseWikiURI accepts a wiki:// URI or a plain root-relative path and returns
+// the root-relative API path.
+func ParseWikiURI(pathOrURI string) (string, error) {
+	pathOrURI = strings.TrimSpace(pathOrURI)
+	if pathOrURI == "" {
+		return "", fmt.Errorf("empty path")
+	}
+	if !strings.Contains(pathOrURI, "://") {
+		return filepath.ToSlash(strings.TrimPrefix(pathOrURI, "/")), nil
+	}
+	u, err := url.Parse(pathOrURI)
+	if err != nil {
+		return "", fmt.Errorf("invalid URI: %w", err)
+	}
+	if !strings.EqualFold(u.Scheme, "wiki") {
+		return "", fmt.Errorf("unsupported URI scheme %q (want wiki)", u.Scheme)
+	}
+	var apiPath string
+	if u.Host != "" {
+		apiPath = u.Host + u.Path
+	} else {
+		apiPath = u.Path
+	}
+	apiPath = strings.TrimPrefix(filepath.ToSlash(apiPath), "/")
+	if apiPath == "" {
+		return "", fmt.Errorf("empty path")
+	}
+	return apiPath, nil
 }

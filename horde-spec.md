@@ -1,6 +1,6 @@
 # horde — Obsidian Vault MCP Server (Go)
 
-**Status:** v1 · M4 complete · updated 2026-07-12
+**Status:** v1.5 · M5 complete (link_graph + attachments) · updated 2026-07-12
 **Owner:** Justin
 **Goal:** Expose an Obsidian vault (plain markdown directory) as a remote MCP server so Claude.ai / Claude mobile can read, search, create, edit, and delete notes, with git as the safety net.
 
@@ -23,7 +23,7 @@ horde (Go, Docker; host-published on 127.0.0.1:8787)  ── validates bearer to
 ~/Documents/Obsidian  (git repo; sole copy — replicated only via git hub + rclone)
 ```
 
-Non-goals for v1: multi-vault support, multi-user auth, wikilink graph analysis, Obsidian plugin/UI features (canvas rendering, dataview execution).
+Non-goals for v1: multi-vault support, multi-user auth, wikilink graph analysis, attachment/binary serving, Obsidian plugin/UI features (canvas rendering, dataview execution). Graph + read-only attachments land in v1.5 (§7, §14); canvas rendering and dataview stay out of scope.
 
 ## 2. Stack & Dependencies
 
@@ -43,6 +43,7 @@ Non-goals for v1: multi-vault support, multi-user auth, wikilink graph analysis,
 - `GET /healthz` — liveness: returns vault path readable, git repo OK, version. Unauthenticated by design.
 - OAuth 2.1 endpoints (enabled when `HORDE_PUBLIC_URL` is set; see §4): `/.well-known/oauth-protected-resource[/mcp]`, `/.well-known/oauth-authorization-server`, `/oauth/register`, `/oauth/authorize`, `/oauth/token`.
 - Binding: inside the container horde binds `0.0.0.0:8787` so the cloudflared sidecar can reach it over the compose network; the host port is published on `127.0.0.1` only. Nothing listens on LAN/WAN.
+- No public static-file / attachment HTTP routes — binaries are MCP-only when v1.5 lands (§7).
 - Session handling per SDK defaults; server is effectively stateless between calls (no in-memory vault index in v1).
 
 ## 4. Authentication
@@ -66,14 +67,16 @@ Two independent layers; both must pass.
 - **Each wiki carries a `taxonomy.md` at its root** describing that wiki's structure, naming, frontmatter, and editing conventions. This file is the contract for how agents edit that wiki. Wikis follow the llm-wiki pattern (Karpathy): per-wiki `index.md` (routing catalog, read before querying), `log.md` (append-only, greppable `## [date] op | title` entries), optional immutable `raw/` sources, and periodic lint passes — all defined in the taxonomy, not in horde. Horde stays a dumb, safe file server; wiki discipline lives in the schema files it serves.
 - **Taxonomy enforcement flow:** the server's MCP `instructions` (initialize response) state: *"Before creating or editing notes in a wiki, read `<wiki>/taxonomy.md` and follow it. If it does not exist, propose one using `create_note` before making other changes."* Lazy-read keeps the instructions payload small regardless of wiki count.
 - A `list_wikis` tool (see §7) enumerates top-level wikis with note counts and whether a `taxonomy.md` exists, so Claude can orient in one call.
-- **Writable extensions:** `.md` only in v1 (`.canvas` read-only).
+- **Writable extensions:** `.md` only — through v1.5 and beyond unless explicitly revisited. No binary writes via horde.
+- **Readable notes (v1):** `.md` fully; `.canvas` read-only as text/JSON (no canvas rendering).
+- **Readable attachments (v1.5):** allowlisted binaries (images, PDF, etc.) via MCP resources / `read_attachment` only — see §7. Note tools (`list_notes`, `search_notes`, `read_note`) stay markdown-focused; they do not return attachment bytes.
 - **Excluded from all operations:** `.obsidian/`, `.git/`, `.trash/`, loose files at the root itself (notes must live inside a wiki), plus configurable ignore globs.
 - Paths in the API are always root-relative with forward slashes and must begin with a wiki name (`network/opnsense/wan-failover.md`).
 - Frontmatter is parsed when present and returned as structured data alongside body content.
 
 ### Path safety (hard requirements)
 1. Clean and resolve every input path; reject anything escaping `HORDE_ROOT` after `filepath.EvalSymlinks` (defeats `..` and symlink tricks).
-2. Reject absolute paths, empty paths, paths into excluded dirs, and disallowed extensions on write.
+2. Reject absolute paths, empty paths, paths into excluded dirs, and disallowed extensions on write (and, for v1.5 attachment reads, disallowed extensions on read).
 3. Max path length 255 bytes/segment; UTF-8 validated.
 
 ### Write safety
@@ -88,7 +91,7 @@ Two independent layers; both must pass.
   `git add -- <path> && git commit -m "mcp(<tool>): <path>" --author "horde <mcp@pluto>"` (explicit paths only — never `-A`; see ADR-4)
 - Deletes are **soft**: `delete_note` does `git rm` + commit (recoverable via git), never `rm` of untracked content without a prior `git add`.
 - Optional `HORDE_GIT_PUSH=1`: async `git push` after commit, best-effort with backoff; failures logged, never block the tool response.
-- v1.5 candidates: `link_graph` tool.
+- v1.5 candidates: `link_graph` tool; read-only attachment serving (§7).
 
 ### Backup strategy (git vs rclone)
 Git and the existing rclone→iDrive job solve different problems and both stay:
@@ -158,12 +161,47 @@ Parse `[[wikilinks]]` across one wiki and return the adjacency map without the a
 - **Out:** `{pages: [{path, out_links, in_link_count}], orphans: [path], broken_links: [{path, target}]}`
 - Powers the lint pass's orphan and broken-link checks in one call instead of N reads.
 
+### Attachments — read-only binary serving (v1.5)
+
+**Why:** Vaults hold images and PDFs next to notes (`![[shot.png]]`, `attachments/…`). Today Claude can only touch `.md` / `.canvas`; without a fetch path, image-bearing notes are half-blind. This is the missing read surface for Claude usability — not an Obsidian feature port.
+
+**Transport shape (preferred):** MCP **resources** with `wiki://` URIs (e.g. `wiki://network/diagrams/wan.png`). Clients that support resources can discover and fetch without a bespoke tool. **Fallback:** a `read_attachment` tool with the same safety rules if Claude connectors prove awkward with resources. Implement one path first; do not ship both indefinitely without a reason.
+
+**No HTTP static files.** Attachments are not served at `/files/…` or similar. Fetch is MCP-only (same auth as tools). Keeps the attack surface inside the existing bearer/OAuth gate and avoids accidental public object storage.
+
+#### Discovery
+- **Resources list** (or `list_attachments` if tool-shaped): enumerate allowlisted files under an optional `path_prefix` / wiki, returning `{uri|path, name, mime_type, size, modified}`.
+- Prune excluded dirs (§5); skip non-allowlisted extensions; do not recurse into `.obsidian` / `.git` / `.trash`.
+- Note tools stay as they are: `list_notes` / `search_notes` continue to skip non-`.md` (and do not index binary content). Attachment discovery is a separate call so agents opt in.
+
+#### Fetch
+- **Resources read** (or `read_attachment`): given a root-relative path or `wiki://` URI, return **raw bytes** plus **correct MIME** (from extension allowlist map; sniff only as a soft check, never to expand the allowlist).
+- Cap response size at `HORDE_MAX_ATTACHMENT_BYTES` (default 5 MiB); reject larger files with an actionable error (path + size + cap) rather than truncating binary payloads.
+- Same path-safety hard requirements as §5: clean/resolve, no escape from `HORDE_ROOT` after `EvalSymlinks`, reject absolute paths, empty paths, and excluded dirs.
+
+#### Allowlist (default)
+| Ext | MIME |
+|---|---|
+| `.png` | `image/png` |
+| `.jpg` / `.jpeg` | `image/jpeg` |
+| `.gif` | `image/gif` |
+| `.webp` | `image/webp` |
+| `.pdf` | `application/pdf` |
+
+Configurable via `HORDE_ATTACHMENT_EXTS` (comma-sep extensions, no dots). Adding a type is a config change + MIME map entry — not an implicit "serve anything".
+
+#### Out of scope (still)
+- **No binary writes** — create/update/delete/move stay `.md`-only; attachments remain Obsidian/human-side (and rclone-backed).
+- **No canvas rendering** — `.canvas` stays readable as text only; horde does not rasterize or interpret canvas graphs.
+- **No Obsidian plugin features** — no dataview, no embed resolution beyond "here are the bytes at this path", no vault-wide media library UI.
+- **No public CDN / cache headers / range requests** in v1.5 — whole-object fetch under the size cap is enough.
+
 ### Deferred (v2)
-`update_links_on_move`, `daily_note`, resources (`wiki://` URIs), vault-wide `replace_all`.
+`update_links_on_move`, `daily_note`, vault-wide `replace_all`. (Attachment/`wiki://` resources moved to v1.5 above.)
 
 ## 8. Tool Descriptions (prompt surface)
 
-Descriptions ship in the binary and matter as much as code. Requirements: state path conventions (root-relative, must start with a wiki name), state that `patch` is preferred over `replace`, state that deletes are git-recoverable, and state that `move_note` doesn't fix links. Include one example call per tool in the description.
+Descriptions ship in the binary and matter as much as code. Requirements: state path conventions (root-relative, must start with a wiki name), state that `patch` is preferred over `replace`, state that deletes are git-recoverable, and state that `move_note` doesn't fix links. Include one example call per tool in the description. For v1.5 attachment resources / `read_attachment`, state the allowlist, size cap, read-only nature, and that note tools do not return binary bytes.
 
 ## 9. Configuration
 
@@ -178,6 +216,8 @@ Descriptions ship in the binary and matter as much as code. Requirements: state 
 | `HORDE_GIT_PUSH` | `0` | Async push after commit |
 | `HORDE_IGNORE` | — | Extra ignore globs, comma-sep |
 | `HORDE_MAX_NOTE_BYTES` | `2097152` | Write size cap |
+| `HORDE_MAX_ATTACHMENT_BYTES` | `5242880` | Read size cap for attachments (v1.5) |
+| `HORDE_ATTACHMENT_EXTS` | `png,jpg,jpeg,gif,webp,pdf` | Allowlisted attachment extensions (v1.5) |
 
 ## 10. Observability
 
@@ -221,6 +261,8 @@ The system is designed to compound, not just persist. Three loops, smallest to l
 - ✅ **M2 — Write path + git:** `create/update/delete/move`, atomic writes, auto-commit, audit logging.
 - ✅ **M3 — Exposure (done 2026-07-12):** docker compose + cloudflared tunnel, OAuth 2.1 connector auth (replaced the WAF-header plan, §4), custom connector live on claude.ai, `hello` tool as a vault-free connectivity check. Outstanding from the original scope: WAF rule (now optional hardening, must be `/mcp`-scoped) and the Claude-mobile end-to-end pass.
 - ✅ **M4 — Polish (done 2026-07-12):** `read_note` offset/length paging, conflict-marker detection on read and write, `history`/`restore` tools, async push via `HORDE_GIT_PUSH`.
+- ✅ **M5 / v1.5 — Graph + attachments (done 2026-07-12):** `link_graph` for lint at scale; read-only attachment serving via MCP resources (`wiki://`) and `list_attachments` / `read_attachment` — allowlisted types, correct MIME, size cap, path safety under `HORDE_ROOT`; no binary writes; no HTTP static file endpoint. Config: `HORDE_MAX_ATTACHMENT_BYTES`, `HORDE_ATTACHMENT_EXTS`.
+- Deferred **v2:** `update_links_on_move`, `daily_note`, vault-wide `replace_all` (see §7).
 
 ## 15. Acceptance Criteria
 
@@ -228,6 +270,12 @@ The system is designed to compound, not just persist. Three loops, smallest to l
 - Any mutation appears as a discrete git commit with tool name and path.
 - A request without the bearer token is blocked at Cloudflare and (if it somehow arrives) rejected by the server.
 - `go test ./...` covers path traversal, symlink escape, patch uniqueness, atomic write, and excluded-dir enforcement.
+
+### v1.5 additions
+- Claude (or MCP Inspector) can discover an allowlisted image/PDF under a wiki and fetch its bytes with the correct MIME, gated by the same auth as tools.
+- Paths outside `HORDE_ROOT`, disallowed extensions, excluded dirs, and oversize files are rejected; binary write tools do not exist.
+- `list_notes` / `search_notes` still skip non-`.md`; attachment discovery does not require changing note-tool semantics.
+- No unauthenticated HTTP route serves vault binaries.
 
 ## 16. Decision Log (ADRs)
 

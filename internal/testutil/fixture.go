@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/justengland/horde/internal/config"
 	"github.com/justengland/horde/internal/server"
 	"github.com/justengland/horde/internal/vault"
 )
@@ -44,7 +45,16 @@ func FixtureVault(t *testing.T) (*vault.Store, string) {
 			t.Fatal(err)
 		}
 	}
-	store, err := server.NewStore(root, nil, 2*1024*1024, nil, false)
+	mime := make(map[string]string, len(config.KnownAttachmentMIME))
+	for k, v := range config.KnownAttachmentMIME {
+		mime[k] = v
+	}
+	store, err := server.NewStore(server.StoreOpts{
+		Root:               root,
+		MaxNoteBytes:       2 * 1024 * 1024,
+		MaxAttachmentBytes: config.DefaultMaxAttachmentBytes,
+		AttachmentMIME:     mime,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

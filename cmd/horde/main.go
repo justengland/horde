@@ -31,7 +31,15 @@ func main() {
 		}
 		gitRepo = &git.Repo{Root: cfg.Root, Push: cfg.GitPush}
 	}
-	store, err := server.NewStore(cfg.Root, cfg.Ignore, cfg.MaxNoteBytes, gitRepo, cfg.ReadOnly)
+	store, err := server.NewStore(server.StoreOpts{
+		Root:               cfg.Root,
+		Ignore:             cfg.Ignore,
+		MaxNoteBytes:       cfg.MaxNoteBytes,
+		MaxAttachmentBytes: cfg.MaxAttachmentBytes,
+		AttachmentMIME:     cfg.AttachmentMIME,
+		Git:                gitRepo,
+		ReadOnly:           cfg.ReadOnly,
+	})
 	if err != nil {
 		slog.Error("store", "err", err)
 		os.Exit(1)

@@ -30,7 +30,11 @@ func initGit(t *testing.T, root string) *git.Repo {
 
 func writeStore(t *testing.T, root string, g *git.Repo) *vault.Store {
 	t.Helper()
-	store, err := server.NewStore(root, nil, 2*1024*1024, g, false)
+	store, err := server.NewStore(server.StoreOpts{
+		Root:         root,
+		MaxNoteBytes: 2 * 1024 * 1024,
+		Git:          g,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +164,11 @@ func TestReadOnlyRejectsWrite(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "network"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	store, err := server.NewStore(root, nil, 2*1024*1024, nil, true)
+	store, err := server.NewStore(server.StoreOpts{
+		Root:         root,
+		MaxNoteBytes: 2 * 1024 * 1024,
+		ReadOnly:     true,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

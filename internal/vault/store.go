@@ -24,11 +24,13 @@ const (
 )
 
 type Store struct {
-	Paths          *paths.Vault
-	MaxNoteBytes   int64
-	ReadLimitBytes int64
-	Git            *git.Repo
-	ReadOnly       bool
+	Paths              *paths.Vault
+	MaxNoteBytes       int64
+	MaxAttachmentBytes int64
+	AttachmentMIME     map[string]string // ext (no dot) → MIME
+	ReadLimitBytes     int64
+	Git                *git.Repo
+	ReadOnly           bool
 }
 
 type WikiInfo struct {

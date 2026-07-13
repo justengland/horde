@@ -129,7 +129,10 @@ func TestUpdateNoteRejectsConflictMarkers(t *testing.T) {
 
 func mustStore(t *testing.T, root string) *vault.Store {
 	t.Helper()
-	store, err := server.NewStore(root, nil, 2*1024*1024, nil, false)
+	store, err := server.NewStore(server.StoreOpts{
+		Root:         root,
+		MaxNoteBytes: 2 * 1024 * 1024,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

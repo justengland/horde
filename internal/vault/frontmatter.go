@@ -7,8 +7,8 @@ import (
 )
 
 type NoteContent struct {
-	Frontmatter map[string]any
-	Body        string
+	Frontmatter    map[string]any
+	Body           string
 	HasFrontmatter bool
 }
 

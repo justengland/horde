@@ -18,7 +18,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const Version = "0.3.0-m3"
+const Version = "0.4.0-m4"
 
 const Instructions = "Before creating or editing notes in a wiki, read `<wiki>/taxonomy.md` and follow it. If it does not exist, propose one using `create_note` before making other changes. Paths are root-relative with forward slashes and must begin with a wiki name (e.g. `network/opnsense/wan-failover.md`). Prefer `update_note` patch mode over replace. Deletes are git-recoverable. `move_note` does not rewrite wikilinks."
 
@@ -124,22 +124,24 @@ func newMCPServer(store *vault.Store) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "read_note",
-		Description: "Read a single markdown note. Example: read_note({path: \"network/opnsense/wan-failover.md\", include_frontmatter: true}). Large notes may be truncated at 100 KiB.",
+		Description: "Read a single markdown note. Example: read_note({path: \"network/opnsense/wan-failover.md\", include_frontmatter: true}). Large notes truncate at 100 KiB; use offset/length to page through the body.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in readNoteIn) (*mcp.CallToolResult, readNoteOut, error) {
 		include := true
 		if in.IncludeFrontmatter != nil {
 			include = *in.IncludeFrontmatter
 		}
-		note, err := store.ReadNote(in.Path, include)
+		note, err := store.ReadNote(in.Path, include, in.Offset, in.Length)
 		if err != nil {
 			return nil, readNoteOut{}, err
 		}
 		out := readNoteOut{
-			Path:      note.Path,
-			Body:      note.Body,
-			Size:      note.Size,
-			Modified:  note.Modified,
-			Truncated: note.Truncated,
+			Path:               note.Path,
+			Body:               note.Body,
+			Size:               note.Size,
+			Modified:           note.Modified,
+			Offset:             note.Offset,
+			Truncated:          note.Truncated,
+			HasConflictMarkers: note.HasConflictMarkers,
 		}
 		if include && note.Frontmatter != nil {
 			out.Frontmatter = note.Frontmatter
@@ -162,6 +164,17 @@ func newMCPServer(store *vault.Store) *mcp.Server {
 			return nil, searchNotesOut{}, err
 		}
 		return nil, searchNotesOut{Results: hits}, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "history",
+		Description: "Git commit history for one note. Example: history({path: \"network/opnsense/wan-failover.md\", limit: 10}). Returns [{hash, message, author, date}] newest first.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in historyIn) (*mcp.CallToolResult, historyOut, error) {
+		entries, err := store.NoteHistory(in.Path, in.Limit)
+		if err != nil {
+			return nil, historyOut{}, err
+		}
+		return nil, historyOut{Commits: entries}, nil
 	})
 
 	if !store.ReadOnly {
@@ -237,6 +250,23 @@ func newMCPServer(store *vault.Store) *mcp.Server {
 			}
 			return nil, *res, nil
 		})
+
+		mcp.AddTool(s, &mcp.Tool{
+			Name:        "restore",
+			Description: "Restore a note from a git ref and commit the result. Example: restore({path: \"network/opnsense/wan-failover.md\", ref: \"abc1234\"}). Use history to find refs.",
+		}, func(ctx context.Context, req *mcp.CallToolRequest, in restoreIn) (*mcp.CallToolResult, vault.WriteResult, error) {
+			start := time.Now()
+			res, err := store.RestoreNote(in.Path, in.Ref)
+			var commit string
+			if res != nil {
+				commit = res.Commit
+			}
+			logTool("restore", []string{in.Path}, start, err, commit, resBytes(res))
+			if err != nil {
+				return nil, vault.WriteResult{}, err
+			}
+			return nil, *res, nil
+		})
 	}
 
 	return s
@@ -291,15 +321,19 @@ type listNotesOut struct {
 type readNoteIn struct {
 	Path               string `json:"path" jsonschema:"Root-relative path to the note"`
 	IncludeFrontmatter *bool  `json:"include_frontmatter,omitempty" jsonschema:"Parse YAML frontmatter when present"`
+	Offset             int64  `json:"offset,omitempty" jsonschema:"Byte offset into the body (or full file when frontmatter is disabled)"`
+	Length             int64  `json:"length,omitempty" jsonschema:"Max bytes to return; defaults to 100 KiB"`
 }
 
 type readNoteOut struct {
-	Path        string         `json:"path"`
-	Frontmatter map[string]any `json:"frontmatter,omitempty"`
-	Body        string         `json:"body"`
-	Size        int64          `json:"size"`
-	Modified    time.Time      `json:"modified"`
-	Truncated   bool           `json:"truncated,omitempty"`
+	Path               string         `json:"path"`
+	Frontmatter        map[string]any `json:"frontmatter,omitempty"`
+	Body               string         `json:"body"`
+	Size               int64          `json:"size"`
+	Modified           time.Time      `json:"modified"`
+	Offset             int64          `json:"offset,omitempty"`
+	Truncated          bool           `json:"truncated,omitempty"`
+	HasConflictMarkers bool           `json:"has_conflict_markers,omitempty"`
 }
 
 type searchNotesIn struct {
@@ -312,6 +346,20 @@ type searchNotesIn struct {
 
 type searchNotesOut struct {
 	Results []vault.SearchHit `json:"results"`
+}
+
+type historyIn struct {
+	Path  string `json:"path" jsonschema:"Root-relative path to the note"`
+	Limit int    `json:"limit,omitempty" jsonschema:"Maximum commits to return (default 20)"`
+}
+
+type historyOut struct {
+	Commits []git.HistoryEntry `json:"commits"`
+}
+
+type restoreIn struct {
+	Path string `json:"path" jsonschema:"Root-relative path to restore"`
+	Ref  string `json:"ref" jsonschema:"Git commit hash or ref"`
 }
 
 type createNoteIn struct {

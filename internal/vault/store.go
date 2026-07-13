@@ -50,7 +50,9 @@ type NoteRead struct {
 	Body               string         `json:"body"`
 	Size               int64          `json:"size"`
 	Modified           time.Time      `json:"modified"`
+	Offset             int64          `json:"offset,omitempty"`
 	Truncated          bool           `json:"truncated,omitempty"`
+	HasConflictMarkers bool           `json:"has_conflict_markers,omitempty"`
 	IncludeFrontmatter bool           `json:"-"`
 }
 
@@ -196,7 +198,7 @@ func sortNotes(notes []NoteMeta, sortBy string) {
 	}
 }
 
-func (s *Store) ReadNote(apiPath string, includeFrontmatter bool) (*NoteRead, error) {
+func (s *Store) ReadNote(apiPath string, includeFrontmatter bool, offset, length int64) (*NoteRead, error) {
 	abs, err := s.Paths.Resolve(apiPath)
 	if err != nil {
 		return nil, err
@@ -215,26 +217,93 @@ func (s *Store) ReadNote(apiPath string, includeFrontmatter bool) (*NoteRead, er
 	if err != nil {
 		return nil, err
 	}
-	truncated := false
-	if int64(len(data)) > s.ReadLimitBytes {
-		data = data[:s.ReadLimitBytes]
-		truncated = true
+	content := string(data)
+	hasConflict := HasConflictMarkers(content)
+	var frontmatter map[string]any
+	if includeFrontmatter {
+		parsed := ParseFrontmatter(data)
+		frontmatter = parsed.Frontmatter
+		content = parsed.Body
+	}
+	if offset < 0 {
+		return nil, fmt.Errorf("offset must be >= 0")
+	}
+	if offset > int64(len(content)) {
+		return nil, fmt.Errorf("offset %d exceeds content length %d", offset, len(content))
+	}
+	chunk := content[offset:]
+	limit := s.ReadLimitBytes
+	if length > 0 {
+		limit = length
+	}
+	truncated := int64(len(chunk)) > limit
+	if truncated {
+		chunk = chunk[:limit]
 	}
 	out := &NoteRead{
 		Path:               apiPath,
 		Size:               info.Size(),
 		Modified:           info.ModTime(),
+		Offset:             offset,
 		Truncated:          truncated,
+		HasConflictMarkers: hasConflict,
 		IncludeFrontmatter: includeFrontmatter,
+		Body:               chunk,
 	}
 	if includeFrontmatter {
-		parsed := ParseFrontmatter(data)
-		out.Frontmatter = parsed.Frontmatter
-		out.Body = parsed.Body
-	} else {
-		out.Body = string(data)
+		out.Frontmatter = frontmatter
 	}
 	return out, nil
+}
+
+// NoteHistory returns git commits for a note path.
+func (s *Store) NoteHistory(apiPath string, limit int) ([]git.HistoryEntry, error) {
+	if s.Git == nil {
+		return nil, fmt.Errorf("git is disabled")
+	}
+	if err := paths.ValidateAPIPath(apiPath); err != nil {
+		return nil, err
+	}
+	if _, err := s.Paths.Resolve(apiPath); err != nil {
+		return nil, err
+	}
+	return s.Git.FileHistory(apiPath, limit)
+}
+
+// RestoreNote checks out a note at ref and commits it.
+func (s *Store) RestoreNote(apiPath, ref string) (*WriteResult, error) {
+	if err := s.checkWritable(); err != nil {
+		return nil, err
+	}
+	if err := s.validateWritePath(apiPath); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(ref) == "" {
+		return nil, fmt.Errorf("ref is required")
+	}
+	if s.Git == nil {
+		return nil, fmt.Errorf("git is disabled")
+	}
+	abs, err := s.Paths.Resolve(apiPath)
+	if err != nil {
+		return nil, err
+	}
+	hash, err := s.Git.RestoreFile("restore", apiPath, ref)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		return nil, err
+	}
+	if HasConflictMarkers(string(data)) {
+		return nil, fmt.Errorf("restored content still has conflict markers; pick another ref")
+	}
+	return &WriteResult{
+		Path:         apiPath,
+		Commit:       hash,
+		BytesWritten: int64(len(data)),
+	}, nil
 }
 
 type SearchParams struct {

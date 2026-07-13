@@ -61,7 +61,7 @@ git checkout <hash>^ -- <path>                # restore a file as it was before 
 git revert <hash>                             # undo one mutation as a new commit
 ```
 
-`delete_note` responses include the exact restore command as `restore_hint`.
+`delete_note` responses include the exact restore command as `restore_hint`. From Claude, `history` lists commits for a path and `restore` checks one out as a new commit.
 
 ## Development
 

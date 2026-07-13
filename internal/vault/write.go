@@ -76,6 +76,13 @@ func (s *Store) CreateNote(apiPath, content string, overwrite bool) (*WriteResul
 		if !overwrite {
 			return nil, fmt.Errorf("file already exists")
 		}
+		existing, err := os.ReadFile(abs)
+		if err != nil {
+			return nil, err
+		}
+		if HasConflictMarkers(string(existing)) {
+			return nil, fmt.Errorf("note has unresolved git conflict markers; resolve before overwriting")
+		}
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
@@ -114,6 +121,9 @@ func (s *Store) UpdateNote(apiPath, mode, oldStr, newStr, content string) (*Writ
 	existing, err := os.ReadFile(abs)
 	if err != nil {
 		return nil, err
+	}
+	if HasConflictMarkers(string(existing)) {
+		return nil, fmt.Errorf("note has unresolved git conflict markers; read it and resolve before editing, or use restore")
 	}
 	updated, err := applyUpdate(string(existing), mode, oldStr, newStr, content)
 	if err != nil {

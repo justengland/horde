@@ -1,6 +1,6 @@
 # horde — Obsidian Vault MCP Server (Go)
 
-**Status:** v1 · M3 complete (live via claude.ai) · updated 2026-07-12
+**Status:** v1 · M4 complete · updated 2026-07-12
 **Owner:** Justin
 **Goal:** Expose an Obsidian vault (plain markdown directory) as a remote MCP server so Claude.ai / Claude mobile can read, search, create, edit, and delete notes, with git as the safety net.
 
@@ -88,7 +88,7 @@ Two independent layers; both must pass.
   `git add -- <path> && git commit -m "mcp(<tool>): <path>" --author "horde <mcp@pluto>"` (explicit paths only — never `-A`; see ADR-4)
 - Deletes are **soft**: `delete_note` does `git rm` + commit (recoverable via git), never `rm` of untracked content without a prior `git add`.
 - Optional `HORDE_GIT_PUSH=1`: async `git push` after commit, best-effort with backoff; failures logged, never block the tool response.
-- v1.5 candidates: `history(path)` and `restore(path, ref)` tools.
+- v1.5 candidates: `link_graph` tool.
 
 ### Backup strategy (git vs rclone)
 Git and the existing rclone→iDrive job solve different problems and both stay:
@@ -122,8 +122,8 @@ Full-text + filename search. **Design: stateless brute-force scan, no index.** R
 - **Out:** array of `{path, size, modified}`; directories implied by paths.
 
 ### `read_note`
-- **In:** `path` (required), `include_frontmatter` (bool, default true)
-- **Out:** `{path, frontmatter (object|null), body, size, modified}`. Files >100 KiB returned with a truncation flag and instructions to use `read_note` with `offset/length` (v1.5) — v1 just truncates head 100 KiB.
+- **In:** `path` (required), `include_frontmatter` (bool, default true), `offset` (int, default 0), `length` (int, default 100 KiB)
+- **Out:** `{path, frontmatter (object|null), body, size, modified, offset, truncated, has_conflict_markers}`. Body is paged via `offset`/`length`; frontmatter is always returned whole when enabled. Conflict markers are flagged but not auto-resolved.
 
 ### `create_note`
 - **In:** `path` (required, must end `.md`), `content` (required), `overwrite` (bool, default **false**)
@@ -142,6 +142,16 @@ Full-text + filename search. **Design: stateless brute-force scan, no index.** R
 - **In:** `from`, `to` (both required), `overwrite` (default false)
 - **Out:** `{from, to, commit}`. v1 does **not** rewrite wikilinks; the tool description says so explicitly so Claude can warn or fix links itself via search+patch.
 
+### `history`
+Git commit log for one note.
+- **In:** `path` (required), `limit` (int, default 20)
+- **Out:** `{commits: [{hash, message, author, date}]}` newest first.
+
+### `restore`
+Check out a note at a git ref and commit the result.
+- **In:** `path` (required), `ref` (required — commit hash or ref)
+- **Out:** `{path, commit, bytes_written}`. Mutating tools reject notes with unresolved conflict markers.
+
 ### `link_graph` (v1.5 — required for lint at scale)
 Parse `[[wikilinks]]` across one wiki and return the adjacency map without the agent reading every page body.
 - **In:** `wiki` (required)
@@ -149,7 +159,7 @@ Parse `[[wikilinks]]` across one wiki and return the adjacency map without the a
 - Powers the lint pass's orphan and broken-link checks in one call instead of N reads.
 
 ### Deferred (v2)
-`update_links_on_move`, `daily_note`, `history`/`restore`, resources (`wiki://` URIs), vault-wide `replace_all`.
+`update_links_on_move`, `daily_note`, resources (`wiki://` URIs), vault-wide `replace_all`.
 
 ## 8. Tool Descriptions (prompt surface)
 
@@ -210,7 +220,7 @@ The system is designed to compound, not just persist. Three loops, smallest to l
 - ✅ **M1 — Read path:** scaffold with official SDK, Streamable HTTP, bearer middleware, `search_notes` / `list_notes` / `read_note`, path-safety tests. Verify with MCP Inspector locally.
 - ✅ **M2 — Write path + git:** `create/update/delete/move`, atomic writes, auto-commit, audit logging.
 - ✅ **M3 — Exposure (done 2026-07-12):** docker compose + cloudflared tunnel, OAuth 2.1 connector auth (replaced the WAF-header plan, §4), custom connector live on claude.ai, `hello` tool as a vault-free connectivity check. Outstanding from the original scope: WAF rule (now optional hardening, must be `/mcp`-scoped) and the Claude-mobile end-to-end pass.
-- **M4 — Polish:** truncation/offsets, conflict-file handling, history/restore, optional push.
+- ✅ **M4 — Polish (done 2026-07-12):** `read_note` offset/length paging, conflict-marker detection on read and write, `history`/`restore` tools, async push via `HORDE_GIT_PUSH`.
 
 ## 15. Acceptance Criteria
 

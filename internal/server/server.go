@@ -12,18 +12,22 @@ import (
 
 	"github.com/justengland/horde/internal/auth"
 	"github.com/justengland/horde/internal/git"
+	"github.com/justengland/horde/internal/oauth"
 	"github.com/justengland/horde/internal/paths"
 	"github.com/justengland/horde/internal/vault"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const Version = "0.2.0-m2"
+const Version = "0.3.0-m3"
 
 const Instructions = "Before creating or editing notes in a wiki, read `<wiki>/taxonomy.md` and follow it. If it does not exist, propose one using `create_note` before making other changes. Paths are root-relative with forward slashes and must begin with a wiki name (e.g. `network/opnsense/wan-failover.md`). Prefer `update_note` patch mode over replace. Deletes are git-recoverable. `move_note` does not rewrite wikilinks."
 
 type Deps struct {
 	Store *vault.Store
 	Token string
+	// PublicURL enables the minimal OAuth 2.1 flow for MCP clients that
+	// cannot send a static bearer header (claude.ai custom connectors).
+	PublicURL string
 }
 
 func NewHTTPServer(deps Deps) http.Handler {
@@ -36,7 +40,13 @@ func NewHTTPServer(deps Deps) http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeHealth(w, deps.Store.Paths.Root)
 	})
-	mux.Handle("/mcp", auth.BearerMiddleware(deps.Token, mcpHandler))
+	var metadataURL string
+	if deps.PublicURL != "" {
+		oa := oauth.New(deps.PublicURL, deps.Token)
+		oa.Register(mux)
+		metadataURL = oa.ResourceMetadataURL()
+	}
+	mux.Handle("/mcp", auth.BearerMiddlewareWithMetadata(deps.Token, metadataURL, mcpHandler))
 
 	return mux
 }
@@ -77,6 +87,13 @@ func newMCPServer(store *vault.Store) *mcp.Server {
 		Version: Version,
 	}, &mcp.ServerOptions{
 		Instructions: Instructions,
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "hello",
+		Description: "Connectivity check — returns a static greeting and the server version. Example: hello() → {message: \"hello from horde\"}. Touches nothing in the vault.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, helloOut, error) {
+		return nil, helloOut{Message: "hello from horde", Version: Version}, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
@@ -249,6 +266,11 @@ func logTool(tool string, paths []string, start time.Time, err error, commit str
 		attrs = append(attrs, "bytes", bytes)
 	}
 	slog.Info("tool call", append(attrs, "result", "ok")...)
+}
+
+type helloOut struct {
+	Message string `json:"message"`
+	Version string `json:"version"`
 }
 
 type listWikisOut struct {

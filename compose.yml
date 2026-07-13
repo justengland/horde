@@ -1,0 +1,39 @@
+services:
+  horde:
+    build: .
+    user: "1000:1000"
+    environment:
+      HORDE_ROOT: /vault
+      # Bind all interfaces inside the container; only loopback is published on the host.
+      HORDE_ADDR: 0.0.0.0:8787
+      HORDE_TOKEN: ${HORDE_TOKEN:?set via dotenvx run -- docker compose ...}
+      HORDE_GIT: ${HORDE_GIT:-on}
+      HORDE_GIT_PUSH: ${HORDE_GIT_PUSH:-false}
+      HORDE_READONLY: ${HORDE_READONLY:-false}
+      # External base URL; enables the OAuth flow for claude.ai connectors.
+      HORDE_PUBLIC_URL: ${HORDE_PUBLIC_URL:-https://horde.crucibleplatform.com}
+    volumes:
+      - ${HORDE_VAULT:-${HOME}/Documents/Obsidian}:/vault
+    ports:
+      - "127.0.0.1:8787:8787"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  # M3 sidecar: publishes horde via Cloudflare Tunnel. Opt in with
+  # `--profile tunnel`; ingress in the CF dashboard should point at
+  # http://horde:8787.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set via dotenvx run -- docker compose ...}
+    depends_on:
+      horde:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles: ["tunnel"]

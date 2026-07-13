@@ -9,16 +9,17 @@ import (
 )
 
 const (
-	DefaultAddr          = "127.0.0.1:8787"
-	DefaultRoot          = "~/Documents/Obsidian"
-	DefaultMaxNoteBytes  = 2 * 1024 * 1024
-	DefaultReadLimit     = 100 * 1024
+	DefaultAddr         = "127.0.0.1:8787"
+	DefaultRoot         = "~/Documents/Obsidian"
+	DefaultMaxNoteBytes = 2 * 1024 * 1024
+	DefaultReadLimit    = 100 * 1024
 )
 
 type Config struct {
 	Root           string
 	Token          string
 	Addr           string
+	PublicURL      string
 	ReadOnly       bool
 	GitEnabled     bool
 	GitPush        bool
@@ -38,6 +39,7 @@ func Load() (Config, error) {
 		Root:           root,
 		Token:          token,
 		Addr:           envOr("HORDE_ADDR", DefaultAddr),
+		PublicURL:      strings.TrimRight(os.Getenv("HORDE_PUBLIC_URL"), "/"),
 		ReadOnly:       envBool("HORDE_READONLY", false),
 		GitEnabled:     gitMode != "off",
 		GitPush:        envBool("HORDE_GIT_PUSH", false),

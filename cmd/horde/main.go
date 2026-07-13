@@ -36,8 +36,8 @@ func main() {
 		slog.Error("store", "err", err)
 		os.Exit(1)
 	}
-	handler := server.NewHTTPServer(server.Deps{Store: store, Token: cfg.Token})
-	slog.Info("horde listening", "addr", cfg.Addr, "root", cfg.Root, "version", server.Version, "readonly", cfg.ReadOnly)
+	handler := server.NewHTTPServer(server.Deps{Store: store, Token: cfg.Token, PublicURL: cfg.PublicURL})
+	slog.Info("horde listening", "addr", cfg.Addr, "root", cfg.Root, "version", server.Version, "readonly", cfg.ReadOnly, "public_url", cfg.PublicURL)
 	if err := http.ListenAndServe(cfg.Addr, handler); err != nil {
 		slog.Error("serve", "err", err)
 		os.Exit(1)

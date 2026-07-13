@@ -1,6 +1,6 @@
 # horde — Obsidian Vault MCP Server (Go)
 
-**Status:** Draft v1 · 2026-07-12
+**Status:** v1 · M3 complete (live via claude.ai) · updated 2026-07-12
 **Owner:** Justin
 **Goal:** Expose an Obsidian vault (plain markdown directory) as a remote MCP server so Claude.ai / Claude mobile can read, search, create, edit, and delete notes, with git as the safety net.
 
@@ -12,12 +12,12 @@ A standalone Go binary that serves the Model Context Protocol over **Streamable 
 
 ```
 Claude (Anthropic cloud)
-   │  HTTPS  (Authorization: Bearer <token>)
+   │  HTTPS  (OAuth 2.1 handshake → Authorization: Bearer <token>)
    ▼
-Cloudflare edge  ── WAF rule: reject requests without valid header ──┐
-   │  cloudflared tunnel (outbound-only from lab)                    │
-   ▼                                                                 │
-horde (Go, 127.0.0.1:8787)  ── validates bearer token ◄──────────┘
+Cloudflare edge  (TLS termination for horde.crucibleplatform.com)
+   │  cloudflared tunnel (outbound-only from lab; sidecar container)
+   ▼
+horde (Go, Docker; host-published on 127.0.0.1:8787)  ── validates bearer token
    │  fs read/write (atomic)
    ▼
 ~/Documents/Obsidian  (git repo; sole copy — replicated only via git hub + rclone)
@@ -40,8 +40,9 @@ Non-goals for v1: multi-vault support, multi-user auth, wikilink graph analysis,
 ## 3. Transport & Endpoints
 
 - `POST/GET /mcp` — MCP Streamable HTTP endpoint (SDK-provided handler).
-- `GET /healthz` — liveness: returns vault path readable, git repo OK, version.
-- Binds `127.0.0.1:8787` only. Nothing listens on LAN/WAN; cloudflared connects over loopback.
+- `GET /healthz` — liveness: returns vault path readable, git repo OK, version. Unauthenticated by design.
+- OAuth 2.1 endpoints (enabled when `HORDE_PUBLIC_URL` is set; see §4): `/.well-known/oauth-protected-resource[/mcp]`, `/.well-known/oauth-authorization-server`, `/oauth/register`, `/oauth/authorize`, `/oauth/token`.
+- Binding: inside the container horde binds `0.0.0.0:8787` so the cloudflared sidecar can reach it over the compose network; the host port is published on `127.0.0.1` only. Nothing listens on LAN/WAN.
 - Session handling per SDK defaults; server is effectively stateless between calls (no in-memory vault index in v1).
 
 ## 4. Authentication
@@ -54,7 +55,9 @@ Two independent layers; both must pass.
 
 **Layer 2 — horde.** Middleware validates `Authorization: Bearer <token>` with constant-time compare against `HORDE_TOKEN`. 401 otherwise. Token: 32+ bytes random, base64url.
 
-**Connector wiring.** Add as a custom connector on claude.ai web (syncs to mobile). Use the Request headers (beta) option: header `authorization`, value `Bearer <token>`. Fallback if the header beta isn't enabled on the account: implement the minimal OAuth 2.1 flow the SDK supports, or front the server with an OAuth-terminating proxy. Treat this as a known risk (§12).
+**Connector wiring (as shipped).** The request-header option was not available; claude.ai custom connectors require the OAuth 2.1 handshake, so horde implements the minimal single-user flow (`internal/oauth`, ADR-9): RFC 9728/8414 discovery, dynamic client registration, authorization code + PKCE (S256, single-use codes, 5-min TTL). The authorize page is a one-field form where Justin pastes `HORDE_TOKEN`; the issued access token *is* `HORDE_TOKEN`, so Layer 2 above is unchanged and no token state is lost on restart. claude.ai's callback hosts are allowlisted so a restart (which wipes in-memory client registrations) can't strand a connected client. Connector setup: add `https://horde.crucibleplatform.com/mcp` as a custom connector with OAuth client ID/secret left blank.
+
+> **WAF caveat:** the Layer-1 rule must be scoped to the `/mcp` path — `/oauth/*` and `/.well-known/*` are hit by claude.ai *before* it has a token, and `/healthz` is intentionally public.
 
 ## 5. Data Model — Wikis
 
@@ -82,7 +85,7 @@ Two independent layers; both must pass.
 
 - Precondition at startup: `HORDE_ROOT` is a git repo with a clean-enough state (untracked files OK). Refuse to start otherwise unless `HORDE_GIT=off`.
 - **Every mutating tool call** runs, after a successful write:
-  `git add -A <path> && git commit -m "mcp(<tool>): <path>" --author "horde <mcp@pluto>"`
+  `git add -- <path> && git commit -m "mcp(<tool>): <path>" --author "horde <mcp@pluto>"` (explicit paths only — never `-A`; see ADR-4)
 - Deletes are **soft**: `delete_note` does `git rm` + commit (recoverable via git), never `rm` of untracked content without a prior `git add`.
 - Optional `HORDE_GIT_PUSH=1`: async `git push` after commit, best-effort with backoff; failures logged, never block the tool response.
 - v1.5 candidates: `history(path)` and `restore(path, ref)` tools.
@@ -173,14 +176,15 @@ Descriptions ship in the binary and matter as much as code. Requirements: state 
 
 ## 11. Deployment
 
-- `CGO_ENABLED=0 go build` → single binary; systemd unit with `EnvironmentFile=/etc/horde.env`, `ProtectSystem=strict`, `ReadWritePaths=<vault>`, `DynamicUser=no` (needs git identity).
-- `cloudflared` config: one ingress rule `obsidian.<domain>` → `http://127.0.0.1:8787`, catch-all 404.
-- Cloudflare WAF custom rule per §4.
+- Docker compose (per ADR-1/ADR-3): multi-stage `Dockerfile` (`CGO_ENABLED=0` build → alpine + git, committer identity and `safe.directory=/vault` baked into the system gitconfig), `compose.yml` with the `horde` service (`user: 1000:1000`, vault bind-mounted at `/vault`, healthcheck on `/healthz`) and a `cloudflared` sidecar behind the `tunnel` profile.
+- Secrets: `.env` is dotenvx-encrypted (`.env.keys` never committed); all compose invocations go through `dotenvx run --`. Make targets: `up`, `up-tunnel`, `down`, `logs`, `hello`.
+- `cloudflared` ingress (Zero Trust dashboard): public hostname `horde.crucibleplatform.com` → service **HTTP** `horde:8787` (compose service name; the cloudflared→horde hop is plain HTTP on the private compose network — TLS terminates at the Cloudflare edge and the tunnel itself is QUIC-encrypted). Catch-all 404.
+- Cloudflare WAF custom rule per §4 (scoped to `/mcp` — see caveat there). Zone: enable "Always Use HTTPS".
 - README covers: token generation, connector setup on claude.ai web, restore-from-git recipes.
 
 ## 12. Risks & Open Questions
 
-1. **Request-header beta availability.** If the account can't use header auth for custom connectors, v1 needs the OAuth fallback (SDK auth support or proxy). Verify early — this is the only external dependency that could force design change.
+1. ~~**Request-header beta availability.**~~ **Resolved 2026-07-12:** header auth was indeed unavailable; the OAuth 2.1 fallback was implemented in horde itself (§4, ADR-9) and verified end-to-end from claude.ai.
 2. **Concurrent interactive edits** (Obsidian save racing a horde write on the same file): atomic rename limits damage to last-write-wins on whole-file content; accepted for v1 per ADR-5's residual-risk note.
 4. **Rate/abuse:** single-user, token-gated; no rate limiting in v1 beyond Cloudflare defaults.
 
@@ -202,9 +206,9 @@ The system is designed to compound, not just persist. Three loops, smallest to l
 
 ## 14. Milestones
 
-- **M1 — Read path:** scaffold with official SDK, Streamable HTTP, bearer middleware, `search_notes` / `list_notes` / `read_note`, path-safety tests. Verify with MCP Inspector locally.
-- **M2 — Write path + git:** `create/update/delete/move`, atomic writes, auto-commit, audit logging.
-- **M3 — Exposure:** cloudflared tunnel, WAF rule, custom connector on claude.ai, end-to-end test from Claude mobile.
+- ✅ **M1 — Read path:** scaffold with official SDK, Streamable HTTP, bearer middleware, `search_notes` / `list_notes` / `read_note`, path-safety tests. Verify with MCP Inspector locally.
+- ✅ **M2 — Write path + git:** `create/update/delete/move`, atomic writes, auto-commit, audit logging.
+- ✅ **M3 — Exposure (done 2026-07-12):** docker compose + cloudflared tunnel, OAuth 2.1 connector auth (replaced the WAF-header plan, §4), custom connector live on claude.ai, `hello` tool as a vault-free connectivity check. Outstanding from the original scope: WAF rule (now optional hardening, must be `/mcp`-scoped) and the Claude-mobile end-to-end pass.
 - **M4 — Polish:** truncation/offsets, conflict-file handling, history/restore, optional push.
 
 ## 15. Acceptance Criteria
@@ -248,3 +252,8 @@ The system is designed to compound, not just persist. Three loops, smallest to l
 ### ADR-8 — Single-device editing; sync is git + iDrive only (2026-07-12)
 **Decision:** The vault is edited on the desktop only (Obsidian) plus horde. No Syncthing, no Obsidian Sync, no phone/laptop replicas. Replication is exactly two mechanisms: the git hub repo (versioning + batch-job isolation per ADR-5) and rclone→iDrive (disaster recovery). Mobile access to the wiki IS horde — Claude is the phone client.
 **Consequences:** all Syncthing considerations removed from the spec (excluded dirs, conflict files, sync-race risks). The concurrency surface shrinks to: Obsidian-vs-horde on the desktop, and interactive-vs-interactive horde sessions (ADR-5 residual).
+
+### ADR-9 — In-process OAuth 2.1 for connector auth (2026-07-12)
+**Context:** claude.ai custom connectors turned out to require the OAuth handshake — the request-header option from §4's original plan was not offered (risk §12.1 materialized).
+**Decision:** Implement the minimal single-user OAuth 2.1 flow inside horde (`internal/oauth`) rather than fronting it with a proxy: discovery metadata (RFC 9728 + 8414), dynamic client registration, authorization code + PKCE (S256). The "login" is pasting `HORDE_TOKEN` into horde's authorize page, and the issued access token **is** `HORDE_TOKEN` — the bearer middleware is untouched, tokens survive restarts, and there is exactly one credential in the system.
+**Consequences:** in-memory client registrations are lost on restart; mitigated by allowlisting claude.ai/claude.com callback hosts for unknown client IDs (safe: an attacker-initiated authorize still requires the token and can only redirect to claude.ai). Any future WAF rule must exempt `/oauth/*` and `/.well-known/*`. Token rotation = rotate `HORDE_TOKEN` and reconnect the connector once.

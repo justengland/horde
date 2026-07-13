@@ -6,9 +6,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/justengland/horde/internal/server"
 	"github.com/justengland/horde/internal/testutil"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 const testToken = "test-token-secret-value-32bytes!!"
@@ -42,6 +42,45 @@ func TestMCPRequiresBearerAuth(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status %d want 401", resp.StatusCode)
+	}
+}
+
+func TestHelloViaMCP(t *testing.T) {
+	store, _ := testutil.FixtureVault(t)
+	handler := server.NewHTTPServer(server.Deps{Store: store, Token: testToken})
+	ts := httptest.NewServer(handler)
+	defer ts.Close()
+
+	ctx := context.Background()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil)
+	httpClient := &http.Client{
+		Transport: bearerRoundTripper{token: testToken, base: http.DefaultTransport},
+	}
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{
+		Endpoint:   ts.URL + "/mcp",
+		HTTPClient: httpClient,
+	}, nil)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer session.Close()
+
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "hello",
+		Arguments: map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool error: %+v", res.Content)
+	}
+	m, ok := res.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("structured content type %T", res.StructuredContent)
+	}
+	if m["message"] != "hello from horde" {
+		t.Fatalf("message = %#v", m["message"])
 	}
 }
 

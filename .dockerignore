@@ -1,0 +1,9 @@
+.git
+.githooks
+bin/
+docs/
+*.md
+.env
+.env.keys
+.claude/
+.agent-run-check.sh

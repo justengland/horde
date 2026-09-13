@@ -19,6 +19,9 @@ const (
 
 // KnownAttachmentMIME maps extension (no dot) → MIME. Configured
 // HORDE_ATTACHMENT_EXTS is intersected with this map; unknown exts are dropped.
+//
+// jpg/jpeg MUST be "image/jpeg" (never "image/jpg") — image/jpg is not a valid
+// MIME type and MCP clients silently drop ImageContent blocks that use it.
 var KnownAttachmentMIME = map[string]string{
 	"png":  "image/png",
 	"jpg":  "image/jpeg",

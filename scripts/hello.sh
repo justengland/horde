@@ -10,6 +10,7 @@ AUTH="Authorization: Bearer $HORDE_TOKEN"
 ACC="Accept: application/json, text/event-stream"
 CT="Content-Type: application/json"
 NOTE=_scratch/hello.md
+SHOT=_scratch/hello.png
 
 body() { grep '^data:' | sed 's/^data: //'; }
 
@@ -54,8 +55,36 @@ call 2 create_note "{\"path\":\"$NOTE\",\"content\":\"# Hello, world!\\n\\nWritt
 echo "==> read_note $NOTE"
 call 3 read_note "{\"path\":\"$NOTE\"}"
 
+echo "==> upload $SHOT (PUT /attachments)"
+PNG=$(mktemp)
+# Smallest valid 1x1 PNG, so the upload exercises the real allowlist/MIME path.
+base64 -d > "$PNG" <<'B64'
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==
+B64
+UP=$(curl -sf -X PUT "$URL/attachments/$SHOT?overwrite=true" -H "$AUTH" --data-binary "@$PNG")
+echo "$UP"
+
+echo "==> download it back (signed link, no auth header)"
+DL=$(printf '%s' "$UP" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("download_url",""))')
+if [ -n "$DL" ]; then
+  GOT=$(mktemp)
+  # -J would honour Content-Disposition; here we just check the bytes survive.
+  curl -sf -o "$GOT" "$DL"
+  cmp -s "$PNG" "$GOT" && echo "download matches upload ✔" || { echo "DOWNLOAD MISMATCH"; exit 1; }
+  rm -f "$GOT"
+else
+  echo "(no download_url — HORDE_PUBLIC_URL is not set)"
+fi
+rm -f "$PNG"
+
+echo "==> list_attachments _scratch"
+call 4 list_attachments "{\"path_prefix\":\"_scratch\"}"
+
+echo "==> delete_attachment $SHOT"
+call 5 delete_attachment "{\"path\":\"$SHOT\",\"confirm\":true}"
+
 echo "==> delete_note $NOTE"
-call 4 delete_note "{\"path\":\"$NOTE\",\"confirm\":true}"
+call 6 delete_note "{\"path\":\"$NOTE\",\"confirm\":true}"
 
 echo
 echo "hello world round-trip OK ✔"

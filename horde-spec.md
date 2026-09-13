@@ -23,7 +23,7 @@ horde (Go, Docker; host-published on 127.0.0.1:8787)  ── validates bearer to
 ~/Documents/Obsidian  (git repo; sole copy — replicated only via git hub + rclone)
 ```
 
-Non-goals for v1: multi-vault support, multi-user auth, wikilink graph analysis, attachment/binary serving, Obsidian plugin/UI features (canvas rendering, dataview execution). Graph + read-only attachments land in v1.5 (§7, §14); signed render links land in v1.6 (§7, ADR-10); canvas rendering and dataview stay out of scope.
+Non-goals for v1: multi-vault support, multi-user auth, wikilink graph analysis, attachment/binary serving, Obsidian plugin/UI features (canvas rendering, dataview execution). Graph + read-only attachments land in v1.5 (§7, §14); signed render links land in v1.6 (§7, ADR-10); attachment uploads, video, and downloads land in v1.7 (§7, ADR-11/12); canvas rendering and dataview stay out of scope.
 
 ## 2. Stack & Dependencies
 
@@ -43,7 +43,8 @@ Non-goals for v1: multi-vault support, multi-user auth, wikilink graph analysis,
 - `GET /healthz` — liveness: returns vault path readable, git repo OK, version. Unauthenticated by design.
 - OAuth 2.1 endpoints (enabled when `HORDE_PUBLIC_URL` is set; see §4): `/.well-known/oauth-protected-resource[/mcp]`, `/.well-known/oauth-authorization-server`, `/oauth/register`, `/oauth/authorize`, `/oauth/token`.
 - Binding: inside the container horde binds `0.0.0.0:8787` so the cloudflared sidecar can reach it over the compose network; the host port is published on `127.0.0.1` only. Nothing listens on LAN/WAN.
-- Exactly one public-but-signed attachment route (v1.6, ADR-10): `GET /render/{path}?exp=<unix>&sig=<hmac>` serves Render Links minted by the attachment tools. No other static-file routes; every other fetch path stays MCP-only behind the bearer/OAuth gate (§7).
+- Exactly one public-but-signed attachment route (v1.6, ADR-10): `GET /render/{path}?exp=<unix>&sig=<hmac>[&download=1]` serves Render Links minted by the attachment tools. It streams (`http.ServeContent`), so it answers Range requests — video seeking and resumed downloads — and `download=1` flips `Content-Disposition` from `inline` to `attachment` (v1.7, ADR-12). No other static-file routes; every other fetch path stays MCP-only behind the bearer/OAuth gate (§7).
+- One bearer-gated upload route (v1.7, ADR-11): `PUT|POST /attachments/{path...}?overwrite=<bool>` streams raw request-body bytes to disk as an attachment, applying exactly the rules `create_attachment` applies. Never signed-and-public — a leaked read link costs one file for six hours, a leaked write link costs the vault. Absent entirely when `HORDE_READONLY` is set.
 - Session handling per SDK defaults; server is effectively stateless between calls (no in-memory vault index in v1).
 
 ## 4. Authentication
@@ -187,21 +188,41 @@ Parse `[[wikilinks]]` across one wiki and return the adjacency map without the a
 | `.gif` | `image/gif` |
 | `.webp` | `image/webp` |
 | `.pdf` | `application/pdf` |
+| `.mp4` / `.m4v` | `video/mp4` |
+| `.webm` | `video/webm` |
+| `.mov` | `video/quicktime` |
 
 Configurable via `HORDE_ATTACHMENT_EXTS` (comma-sep extensions, no dots). Adding a type is a config change + MIME map entry — not an implicit "serve anything".
 
+#### Attachment uploads (v1.7, amends the "no binary writes" rule — ADR-11)
+
+**Why:** v1.5 assumed binaries only ever arrive from Obsidian or a human. They also arrive from the agent — a generated diagram, a screenshot handed to it, a PDF worth filing next to the note that cites it — and the read-only rule forced a trip outside the session to file each one.
+
+**Two transports, one rule set.** `create_attachment` takes `content_base64` (in-session, any MCP client, but ~33% base64 overhead — small files); `PUT|POST /attachments/{path...}` streams the raw body to disk behind the bearer gate (efficient, and the only path for video). Both funnel through one write path enforcing the configured allowlist, `HORDE_MAX_ATTACHMENT_BYTES`, the same path safety as reads (inside a wiki, no traversal, no excluded dirs), one git commit per write, and refusal under `HORDE_READONLY`. Uploads are immediately visible to `list_attachments` / `read_attachment` / Render Links.
+
+**Parity with the note tools.** `delete_attachment` (git-recoverable, `confirm` required) and `move_attachment` (does not rewrite the `![[embeds]]` pointing at the file, exactly like `move_note`). No new config knob: `HORDE_READONLY` is the write switch, and the extension allowlist is now a write-side gate as much as a read-side one.
+
+#### Video + downloads (v1.7, ADR-12)
+
+**Why:** vaults hold clips and screen recordings, and "view this" is not "keep this". The v1.6 route buffered whole files, served them with no `Content-Disposition`, and the allowlist stopped at PDF.
+
+- **Video in the allowlist:** `mp4`, `m4v`, `webm`, `mov` ship in the defaults. The allowlist gates uploads too, so video can be filed as well as fetched.
+- **The route streams** via `http.ServeContent`, which brings Range with it — a browser's `<video>` seeks with Range, and an interrupted download resumes with it. `Cache-Control: private, no-store` still applies to ranged responses.
+- **Two caps, split by mechanism:** `HORDE_MAX_ATTACHMENT_BYTES` (5 MB) bounds what may be held in memory and base64'd into an MCP response; `HORDE_MAX_STREAM_BYTES` (512 MB) bounds the streaming HTTP paths (download and upload).
+- **`url` + `download_url`** on every attachment tool: the same signed link, `download_url` adding `?download=1` for `Content-Disposition: attachment` plus filename. The signature covers path and expiry only, so the parameter grants no extra access.
+- **`read_attachment` stats first:** video and anything past the inline cap return metadata and links with `inlined: false`, rather than failing or base64-ing a 200 MB clip into a JSON-RPC response.
+
 #### Out of scope (still)
-- **No binary writes** — create/update/delete/move stay `.md`-only; attachments remain Obsidian/human-side (and rclone-backed).
 - **No canvas rendering** — `.canvas` stays readable as text only; horde does not rasterize or interpret canvas graphs.
 - **No Obsidian plugin features** — no dataview, no embed resolution beyond "here are the bytes at this path", no vault-wide media library UI.
-- **No CDN / range requests** — whole-object fetch under the size cap is enough. (The v1.6 render route sets `Cache-Control: no-store`, but that is leak control, not a caching feature.)
+- **No CDN** — no edge caching of vault bytes; `Cache-Control: no-store` is leak control, not a caching feature. (v1.7 does add Range support to the render route, for video seeking and resumable downloads — ADR-12 — but there is still no CDN, no transcoding, and no thumbnailing.)
 
 ### Deferred (v2)
 `update_links_on_move`, `daily_note`, vault-wide `replace_all`. (Attachment/`wiki://` resources moved to v1.5 above.)
 
 ## 8. Tool Descriptions (prompt surface)
 
-Descriptions ship in the binary and matter as much as code. Requirements: state path conventions (root-relative, must start with a wiki name), state that `patch` is preferred over `replace`, state that deletes are git-recoverable, and state that `move_note` doesn't fix links. Include one example call per tool in the description. For v1.5 attachment resources / `read_attachment`, state the allowlist, size cap, read-only nature, and that note tools do not return binary bytes. For v1.6, state that `url` is a short-lived Render Link (~6 h) for inline display only — not a permalink or share link.
+Descriptions ship in the binary and matter as much as code. Requirements: state path conventions (root-relative, must start with a wiki name), state that `patch` is preferred over `replace`, state that deletes are git-recoverable, and state that `move_note` doesn't fix links. Include one example call per tool in the description. For v1.5 attachment resources / `read_attachment`, state the allowlist, size cap, read-only nature, and that note tools do not return binary bytes. For v1.6, state that `url` is a short-lived Render Link (~6 h) for inline display only — not a permalink or share link. For v1.7, state that `download_url` saves the file while `url` displays it, that video is never inlined, the base64 encoding and the raw-body HTTP alternative for writes, that the allowlist and size cap apply to writes, that deletes are git-recoverable, and that `move_attachment` does not fix `![[embeds]]`.
 
 ## 9. Configuration
 
@@ -216,10 +237,11 @@ Descriptions ship in the binary and matter as much as code. Requirements: state 
 | `HORDE_GIT_PUSH` | `0` | Async push after commit |
 | `HORDE_IGNORE` | — | Extra ignore globs, comma-sep |
 | `HORDE_MAX_NOTE_BYTES` | `2097152` | Write size cap |
-| `HORDE_MAX_ATTACHMENT_BYTES` | `5242880` | Read size cap for attachments (v1.5) |
-| `HORDE_ATTACHMENT_EXTS` | `png,jpg,jpeg,gif,webp,pdf` | Allowlisted attachment extensions (v1.5) |
+| `HORDE_MAX_ATTACHMENT_BYTES` | `5242880` | Cap for in-memory attachment paths: MCP inline reads (v1.5) and base64 writes (v1.7) |
+| `HORDE_MAX_STREAM_BYTES` | `536870912` | Cap for the streaming HTTP paths — download route and upload route (v1.7) |
+| `HORDE_ATTACHMENT_EXTS` | `png,jpg,jpeg,gif,webp,pdf,mp4,webm,mov,m4v` | Allowlisted attachment extensions — gates reads (v1.5) and uploads (v1.7) |
 
-Render Links (v1.6) deliberately add no config: the TTL is a fixed ~6 h and the signing secret is generated at boot (a restart revokes all outstanding links) — see ADR-10.
+Attachment uploads (v1.7) deliberately add no config either: `HORDE_READONLY` is the write switch and the existing allowlist/cap bound what may be written — see ADR-11. Render Links (v1.6) deliberately add no config: the TTL is a fixed ~6 h and the signing secret is generated at boot (a restart revokes all outstanding links) — see ADR-10.
 
 ## 10. Observability
 
@@ -266,6 +288,7 @@ The system is designed to compound, not just persist. Three loops, smallest to l
 - ✅ **M4 — Polish (done 2026-07-12):** `read_note` offset/length paging, conflict-marker detection on read and write, `history`/`restore` tools, async push via `HORDE_GIT_PUSH`.
 - ✅ **M5 / v1.5 — Graph + attachments (done 2026-07-12):** `link_graph` for lint at scale; read-only attachment serving via MCP resources (`wiki://`) and `list_attachments` / `read_attachment` — allowlisted types, correct MIME, size cap, path safety under `HORDE_ROOT`; no binary writes; no HTTP static file endpoint. Config: `HORDE_MAX_ATTACHMENT_BYTES`, `HORDE_ATTACHMENT_EXTS`.
 - ✅ **M6 / v1.6 — Render Links (done 2026-07-13):** `url` field on `list_attachments` / `read_attachment` (when `HORDE_PUBLIC_URL` is set) + the signed `GET /render/{path}` route (ADR-10). Same allowlist / cap / path safety as `read_attachment`; boot-generated HMAC secret; ~6 h expiry; `Cache-Control: private, no-store`. Outstanding: the claude.ai inline-display pass needs the live deploy to verify.
+- ✅ **M7 / v1.7 — Uploads, video, downloads (done 2026-09-13):** `create_attachment` (base64) + the bearer-gated streaming `PUT|POST /attachments/{path...}` route, plus `delete_attachment` / `move_attachment` (ADR-11). Video in the allowlist, `http.ServeContent` streaming with Range, and `download_url` / `?download=1` for save-to-disk (ADR-12). Supersedes §7's "no binary writes"; same allowlist / path safety as reads, one git commit per write, all absent under `HORDE_READONLY`. Config: `HORDE_MAX_STREAM_BYTES`.
 - Deferred **v2:** `update_links_on_move`, `daily_note`, vault-wide `replace_all` (see §7).
 
 ## 15. Acceptance Criteria
@@ -277,7 +300,7 @@ The system is designed to compound, not just persist. Three loops, smallest to l
 
 ### v1.5 additions
 - Claude (or MCP Inspector) can discover an allowlisted image/PDF under a wiki and fetch its bytes with the correct MIME, gated by the same auth as tools.
-- Paths outside `HORDE_ROOT`, disallowed extensions, excluded dirs, and oversize files are rejected; binary write tools do not exist.
+- Paths outside `HORDE_ROOT`, disallowed extensions, excluded dirs, and oversize files are rejected. (v1.7 lifts the "binary write tools do not exist" half of this; the rejections still apply, now on writes too — ADR-11.)
 - `list_notes` / `search_notes` still skip non-`.md`; attachment discovery does not require changing note-tool semantics.
 - No unauthenticated HTTP route serves vault binaries. (v1.6 narrows this to: no *unsigned* route — Render Links are the sole, signature-gated exception; see ADR-10.)
 
@@ -286,6 +309,14 @@ The system is designed to compound, not just persist. Three loops, smallest to l
 - The same URL after expiry — or after a horde restart — returns an error, including through Cloudflare (no cached body served).
 - A tampered path, expiry, or signature is rejected; disallowed extensions and excluded dirs are never signed and never served.
 - An image embedded via its Render Link displays inline in a claude.ai conversation.
+
+### v1.7 additions
+- `create_attachment` with base64 content and `PUT /attachments/{path}` with a raw body both land the same bytes at the same path, produce one git commit each, and are immediately returned by `list_attachments`.
+- An mp4 uploaded through the HTTP route downloads intact through its `download_url`, plays in a browser (Range requests answered with 206), and never comes back as bytes from `read_attachment`.
+- Opening `url` displays an image in the browser; opening `download_url` saves it under its own filename.
+- A file past `HORDE_MAX_STREAM_BYTES` is rejected on upload and leaves no partial file or temp file in the vault.
+- Uploads of disallowed extensions, oversize bodies, paths outside a wiki, and traversal attempts are rejected by both transports; an upload without a valid bearer token writes nothing.
+- Under `HORDE_READONLY`, the three attachment write tools are absent from `tools/list` and the upload route is not mounted.
 
 ## 16. Decision Log (ADRs)
 
@@ -331,3 +362,13 @@ The system is designed to compound, not just persist. Three loops, smallest to l
 **Context:** claude.ai does not render `ImageContent` from connector tool results, so v1.5's MCP-only attachment fetch leaves image-bearing notes invisible in chat.
 **Decision:** Supersede §7's "No HTTP static files" rule with exactly one route: attachment tools mint HMAC-signed, ~6 h-expiring **Render Links** (`GET /render/{path}?exp&sig`) serving precisely what `read_attachment` serves. A render helper for MCP conversations, not a file server. Full record: [docs/adr/0010-render-links-for-attachments.md](docs/adr/0010-render-links-for-attachments.md); glossary: [CONTEXT.md](CONTEXT.md).
 **Consequences:** boot-generated secret (restart = mass revocation, zero secret management); `Cache-Control: no-store` required because of Cloudflare edge caching; if claude.ai ever renders `ImageContent`, the route can be retired.
+
+### ADR-11 — Attachment uploads: two write paths, one rule set (2026-09-13)
+**Context:** v1.5 made attachments read-only on the assumption that binaries only arrive from Obsidian or a human; agents also produce files that belong next to notes, and filing each one meant leaving the session.
+**Decision:** Allow binary writes for exactly the files horde already agrees to read, via `create_attachment` (base64, in-session) and a bearer-gated `PUT|POST /attachments/{path...}` (raw body), both funnelling through one write path with the existing allowlist, size cap, path safety, and git commit; `delete_attachment` / `move_attachment` complete parity with the note tools. Supersedes §7's "No binary writes". Full record: [docs/adr/0011-attachment-uploads.md](docs/adr/0011-attachment-uploads.md); glossary: [CONTEXT.md](CONTEXT.md).
+**Consequences:** binaries now enter git history (blobs don't delta-compress, so `.git/` grows faster; the size cap bounds each commit and rclone already backs up `.git/`); the extension allowlist becomes a write-side gate as much as a read-side one; uploads are indistinguishable from human-filed files except by commit message.
+
+### ADR-12 — Streaming downloads: video in the allowlist, save as well as view (2026-09-13)
+**Context:** ADR-10's route buffered whole files, served them with no `Content-Disposition`, and the allowlist stopped at PDF — so vault video could be neither stored nor served, and "view this" had no "keep this".
+**Decision:** Allowlist `mp4`/`m4v`/`webm`/`mov`; stream the route through `http.ServeContent` (Range support for video seeking and resumable downloads); split the caps by mechanism (`HORDE_MAX_ATTACHMENT_BYTES` for in-memory/base64 paths, `HORDE_MAX_STREAM_BYTES` for streaming HTTP ones); return `download_url` (`?download=1` → `Content-Disposition: attachment`) alongside `url` on every attachment tool; and have `read_attachment` stat first, returning links with `inlined: false` for video and oversize files. Full record: [docs/adr/0012-streaming-downloads-and-video.md](docs/adr/0012-streaming-downloads-and-video.md).
+**Consequences:** `.git/` grows faster with video blobs; downloads cost file descriptors and bandwidth rather than RAM; a leaked link now exposes a potentially much larger file for the same ~6 h; no transcoding or thumbnailing (horde serves what is in the vault).

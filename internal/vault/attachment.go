@@ -139,3 +139,85 @@ func (s *Store) attachmentMIME(apiPath string) (string, bool) {
 	mime, ok := s.AttachmentMIME[ext]
 	return mime, ok
 }
+
+// AttachmentFile is an open attachment ready to stream to an HTTP response.
+// The caller owns File and must close it.
+type AttachmentFile struct {
+	Path     string
+	Name     string
+	MIMEType string
+	Size     int64
+	Modified time.Time
+	File     *os.File
+}
+
+// OpenAttachment opens an allowlisted attachment for streaming. Unlike
+// ReadAttachment it never buffers the whole file, so it carries the larger
+// MaxStreamBytes cap — big enough for video, which no MCP response could hold.
+func (s *Store) OpenAttachment(pathOrURI string) (*AttachmentFile, error) {
+	apiPath, err := paths.ParseWikiURI(pathOrURI)
+	if err != nil {
+		return nil, err
+	}
+	if err := paths.ValidateAPIPath(apiPath); err != nil {
+		return nil, err
+	}
+	if !s.Paths.IsNotePath(apiPath) {
+		return nil, fmt.Errorf("attachments must live inside a wiki")
+	}
+	mime, ok := s.attachmentMIME(apiPath)
+	if !ok {
+		return nil, fmt.Errorf("extension is not an allowlisted attachment type")
+	}
+	abs, err := s.Paths.Resolve(apiPath)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return nil, err
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("path is a directory")
+	}
+	if info.Size() > s.streamCap() {
+		return nil, fmt.Errorf("attachment %s size %d exceeds cap %d bytes", apiPath, info.Size(), s.streamCap())
+	}
+	f, err := os.Open(abs)
+	if err != nil {
+		return nil, err
+	}
+	return &AttachmentFile{
+		Path:     apiPath,
+		Name:     filepath.Base(apiPath),
+		MIMEType: mime,
+		Size:     info.Size(),
+		Modified: info.ModTime(),
+		File:     f,
+	}, nil
+}
+
+// StatAttachment returns metadata for an allowlisted attachment without
+// reading it — enough to decide whether it can be inlined in an MCP response.
+func (s *Store) StatAttachment(pathOrURI string) (*AttachmentMeta, error) {
+	af, err := s.OpenAttachment(pathOrURI)
+	if err != nil {
+		return nil, err
+	}
+	defer af.File.Close()
+	return &AttachmentMeta{
+		URI:      paths.WikiURI(af.Path),
+		Path:     af.Path,
+		Name:     af.Name,
+		MIMEType: af.MIMEType,
+		Size:     af.Size,
+		Modified: af.Modified,
+	}, nil
+}
+
+func (s *Store) streamCap() int64 {
+	if s.MaxStreamBytes > 0 {
+		return s.MaxStreamBytes
+	}
+	return s.MaxAttachmentBytes
+}

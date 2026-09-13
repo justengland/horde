@@ -2,7 +2,9 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
+	"mime"
 	"net/http"
 	"strconv"
 	"time"
@@ -12,8 +14,13 @@ import (
 )
 
 // handleRender serves the one public-but-signed attachment route (ADR-10).
-// It serves precisely what read_attachment serves — same allowlist, size
-// cap, and path safety — and nothing is ever served unsigned.
+// It applies the same allowlist and path safety as read_attachment, and
+// nothing is ever served unsigned.
+//
+// It streams via http.ServeContent rather than buffering, which also answers
+// Range requests — what a browser's <video> element needs to seek, and what a
+// paused download needs to resume. ?download=1 flips Content-Disposition from
+// inline to attachment so a click saves the file instead of rendering it.
 func handleRender(store *vault.Store, signer *render.Signer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -28,17 +35,37 @@ func handleRender(store *vault.Store, signer *render.Signer) http.HandlerFunc {
 			http.Error(w, "invalid or expired render link", status)
 			return
 		}
-		att, err := store.ReadAttachment(apiPath)
+		att, err := store.OpenAttachment(apiPath)
 		if err != nil {
 			logRender(apiPath, start, http.StatusNotFound, 0)
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
+		defer att.File.Close()
+
+		disposition := "inline"
+		if download, _ := strconv.ParseBool(q.Get("download")); download {
+			disposition = "attachment"
+		}
+		w.Header().Set("Content-Disposition", mime.FormatMediaType(disposition,
+			map[string]string{"filename": att.Name}))
 		w.Header().Set("Content-Type", att.MIMEType)
-		w.Header().Set("Content-Length", strconv.FormatInt(att.Size, 10))
+		// ServeContent negotiates Range and sets Content-Length itself; a
+		// zero modtime keeps it from emitting Last-Modified validators that
+		// would invite caching we just told the edge not to do.
 		logRender(apiPath, start, http.StatusOK, att.Size)
-		_, _ = w.Write(att.Bytes)
+		http.ServeContent(w, r, att.Name, time.Time{}, att.File)
 	}
+}
+
+// downloadURL turns a minted Render Link into one that saves to disk.
+// The signature covers path and expiry only, so the extra parameter grants
+// no access a plain Render Link doesn't already grant.
+func downloadURL(minted string) string {
+	if minted == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s&download=1", minted)
 }
 
 func renderStatus(err error) int {

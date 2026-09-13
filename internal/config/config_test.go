@@ -19,7 +19,10 @@ func TestLoadAttachmentDefaults(t *testing.T) {
 	if cfg.MaxAttachmentBytes != config.DefaultMaxAttachmentBytes {
 		t.Fatalf("MaxAttachmentBytes = %d", cfg.MaxAttachmentBytes)
 	}
-	want := []string{"png", "jpg", "jpeg", "gif", "webp", "pdf"}
+	if cfg.MaxStreamBytes != config.DefaultMaxStreamBytes {
+		t.Fatalf("MaxStreamBytes = %d", cfg.MaxStreamBytes)
+	}
+	want := []string{"png", "jpg", "jpeg", "gif", "webp", "pdf", "mp4", "webm", "mov", "m4v"}
 	if len(cfg.AttachmentExts) != len(want) {
 		t.Fatalf("AttachmentExts = %#v", cfg.AttachmentExts)
 	}
@@ -30,6 +33,23 @@ func TestLoadAttachmentDefaults(t *testing.T) {
 	}
 	if cfg.AttachmentMIME["png"] != "image/png" {
 		t.Fatalf("png mime = %q", cfg.AttachmentMIME["png"])
+	}
+	// .jpg / .jpeg must be image/jpeg — never image/jpg (invalid; clients drop the block).
+	if cfg.AttachmentMIME["jpg"] != "image/jpeg" {
+		t.Fatalf("jpg mime = %q, want image/jpeg", cfg.AttachmentMIME["jpg"])
+	}
+	if cfg.AttachmentMIME["jpeg"] != "image/jpeg" {
+		t.Fatalf("jpeg mime = %q, want image/jpeg", cfg.AttachmentMIME["jpeg"])
+	}
+	if cfg.AttachmentMIME["mp4"] != "video/mp4" {
+		t.Fatalf("mp4 mime = %q, want video/mp4", cfg.AttachmentMIME["mp4"])
+	}
+	if cfg.AttachmentMIME["mov"] != "video/quicktime" {
+		t.Fatalf("mov mime = %q, want video/quicktime", cfg.AttachmentMIME["mov"])
+	}
+	// Video is never inlined in an MCP response; images and PDFs are.
+	if !config.IsStreamOnlyMIME("video/mp4") || config.IsStreamOnlyMIME("image/png") {
+		t.Fatal("IsStreamOnlyMIME should cover video only")
 	}
 	if cfg.AttachmentMIME["pdf"] != "application/pdf" {
 		t.Fatalf("pdf mime = %q", cfg.AttachmentMIME["pdf"])

@@ -13,8 +13,9 @@ const (
 	DefaultRoot               = "~/Documents/Obsidian"
 	DefaultMaxNoteBytes       = 2 * 1024 * 1024
 	DefaultMaxAttachmentBytes = 5 * 1024 * 1024
+	DefaultMaxStreamBytes     = 512 * 1024 * 1024
 	DefaultReadLimit          = 100 * 1024
-	DefaultAttachmentExts     = "png,jpg,jpeg,gif,webp,pdf"
+	DefaultAttachmentExts     = "png,jpg,jpeg,gif,webp,pdf,mp4,webm,mov,m4v"
 )
 
 // KnownAttachmentMIME maps extension (no dot) → MIME. Configured
@@ -29,6 +30,17 @@ var KnownAttachmentMIME = map[string]string{
 	"gif":  "image/gif",
 	"webp": "image/webp",
 	"pdf":  "application/pdf",
+	"mp4":  "video/mp4",
+	"m4v":  "video/mp4",
+	"webm": "video/webm",
+	"mov":  "video/quicktime",
+}
+
+// IsStreamOnlyMIME reports whether a type is too large-by-nature to inline in
+// an MCP response. Video is fetched through the download route instead, which
+// streams and supports Range requests.
+func IsStreamOnlyMIME(mime string) bool {
+	return strings.HasPrefix(mime, "video/")
 }
 
 type Config struct {
@@ -42,6 +54,7 @@ type Config struct {
 	Ignore             []string
 	MaxNoteBytes       int64
 	MaxAttachmentBytes int64
+	MaxStreamBytes     int64
 	AttachmentExts     []string          // effective allowlist (no dots)
 	AttachmentMIME     map[string]string // ext → MIME for effective allowlist
 	ReadLimitBytes     int64
@@ -65,6 +78,7 @@ func Load() (Config, error) {
 		GitPush:            envBool("HORDE_GIT_PUSH", false),
 		MaxNoteBytes:       envInt64("HORDE_MAX_NOTE_BYTES", DefaultMaxNoteBytes),
 		MaxAttachmentBytes: envInt64("HORDE_MAX_ATTACHMENT_BYTES", DefaultMaxAttachmentBytes),
+		MaxStreamBytes:     envInt64("HORDE_MAX_STREAM_BYTES", DefaultMaxStreamBytes),
 		AttachmentExts:     exts,
 		AttachmentMIME:     mime,
 		ReadLimitBytes:     DefaultReadLimit,

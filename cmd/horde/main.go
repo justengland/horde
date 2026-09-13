@@ -36,6 +36,7 @@ func main() {
 		Ignore:             cfg.Ignore,
 		MaxNoteBytes:       cfg.MaxNoteBytes,
 		MaxAttachmentBytes: cfg.MaxAttachmentBytes,
+		MaxStreamBytes:     cfg.MaxStreamBytes,
 		AttachmentMIME:     cfg.AttachmentMIME,
 		Git:                gitRepo,
 		ReadOnly:           cfg.ReadOnly,

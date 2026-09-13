@@ -1,6 +1,6 @@
 # horde
 
-An Obsidian vault served as a remote MCP server, so Claude (claude.ai web and mobile) can read, search, create, edit, and delete notes — with every mutation landing as a discrete git commit. Design and decision log: [horde-spec.md](horde-spec.md).
+An Obsidian vault served as a remote MCP server, so Claude (claude.ai web and mobile) can read, search, create, edit, and delete notes — and file images, PDFs, and video alongside them — with every mutation landing as a discrete git commit. Design and decision log: [horde-spec.md](horde-spec.md).
 
 ```
 Claude ── HTTPS/OAuth ──> Cloudflare edge ── tunnel ──> horde (Docker) ──> ~/Documents/Obsidian (git)
@@ -28,7 +28,25 @@ make down        # stop everything
 | `HORDE_ROOT` | `~/Documents/Obsidian` | Vault path (mounted at `/vault` in compose) |
 | `HORDE_PUBLIC_URL` | set in `compose.yml` | External base URL; enables the OAuth endpoints |
 | `HORDE_GIT` / `HORDE_GIT_PUSH` | `on` / `false` | Git auto-commit / async push after commit |
-| `HORDE_READONLY` | `false` | Disable all mutating tools |
+| `HORDE_READONLY` | `false` | Disable all mutating tools, including attachment uploads |
+| `HORDE_MAX_ATTACHMENT_BYTES` | `5242880` | Cap for in-memory paths: MCP inline reads and base64 uploads |
+| `HORDE_MAX_STREAM_BYTES` | `536870912` | Cap for streaming paths: the download route and HTTP uploads |
+| `HORDE_ATTACHMENT_EXTS` | `png,jpg,jpeg,gif,webp,pdf,mp4,webm,mov,m4v` | Allowlisted attachment extensions (gates reads and uploads) |
+
+## Attachments: upload and download
+
+Images, PDFs, and video (the `HORDE_ATTACHMENT_EXTS` allowlist) can be written into the vault two ways. In an MCP session, Claude calls `create_attachment` with base64 bytes. From a terminal, PUT the raw file — better for anything past a few hundred KB, since base64 costs ~33% in tokens:
+
+```bash
+curl -X PUT \
+  -H "Authorization: Bearer $(dotenvx get HORDE_TOKEN)" \
+  --data-binary @rack.png \
+  "https://horde.crucibleplatform.com/attachments/Pegasus/90%20Assets/Photos/rack.png"
+```
+
+Add `?overwrite=true` to replace an existing file. Both paths apply the same rules: allowlisted extension, inside a wiki, one git commit per write, and nothing at all when `HORDE_READONLY` is set. The two caps differ by mechanism — `create_attachment` holds the file in memory and is capped at `HORDE_MAX_ATTACHMENT_BYTES` (5 MB), while the HTTP route streams to disk and is capped at `HORDE_MAX_STREAM_BYTES` (512 MB), which is what makes video uploadable.
+
+Every attachment tool returns two short-lived (~6 h) links: `url` displays the file inline in chat or a browser, and `download_url` (the same link plus `?download=1`) saves it under its own filename. Downloads stream and answer Range requests, so a browser can seek through a video and an interrupted download resumes. Video is never returned as bytes in an MCP response — `read_attachment` answers with `inlined: false` and the links instead. `delete_attachment` and `move_attachment` mirror the note tools — git-recoverable, and like `move_note` they don't rewrite the `![[embeds]]` pointing at the file. See [ADR-11](docs/adr/0011-attachment-uploads.md) and [ADR-12](docs/adr/0012-streaming-downloads-and-video.md).
 
 ## Token generation
 

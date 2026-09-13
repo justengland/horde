@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/justengland/horde/internal/auth"
+	"github.com/justengland/horde/internal/config"
 	"github.com/justengland/horde/internal/git"
 	"github.com/justengland/horde/internal/oauth"
 	"github.com/justengland/horde/internal/paths"
@@ -20,9 +22,9 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const Version = "0.6.0-m6"
+const Version = "0.7.0-m7"
 
-const Instructions = "Before creating or editing notes in a wiki, read `<wiki>/taxonomy.md` and follow it. If it does not exist, propose one using `create_note` before making other changes. Paths are root-relative with forward slashes and must begin with a wiki name (e.g. `network/opnsense/wan-failover.md`). Prefer `update_note` patch mode over replace. Deletes are git-recoverable. `move_note` does not rewrite wikilinks. IMPORTANT: To find or view images/PDFs, call `list_attachments` then `read_attachment` (or resources/read on the returned wiki:// URI). `list_notes` / `search_notes` / `read_note` only cover markdown — they never list or return binary files, even when a note embeds `![[photo.png]]`. Attachments are read-only."
+const Instructions = "Before creating or editing notes in a wiki, read `<wiki>/taxonomy.md` and follow it. If it does not exist, propose one using `create_note` before making other changes. Paths are root-relative with forward slashes and must begin with a wiki name (e.g. `network/opnsense/wan-failover.md`). Prefer `update_note` patch mode over replace. Deletes are git-recoverable. `move_note` does not rewrite wikilinks. IMPORTANT: To find or view images/PDFs, call `list_attachments` then `read_attachment` (or resources/read on the returned wiki:// URI). `list_notes` / `search_notes` / `read_note` only cover markdown — they never list or return binary files, even when a note embeds `![[photo.png]]`. To add an image, PDF, or video, call `create_attachment` with base64 bytes (or PUT the raw bytes to /attachments/{path} with the bearer token — required for video, which is too big to base64); `delete_attachment` and `move_attachment` mirror the note tools. Every attachment tool returns `url` (view inline) and `download_url` (save the file); both are short-lived. Video is never returned as bytes — hand the user its download_url."
 
 type Deps struct {
 	Store *vault.Store
@@ -57,6 +59,11 @@ func NewHTTPServer(deps Deps) http.Handler {
 		mux.HandleFunc("GET /render/{path...}", handleRender(deps.Store, signer))
 	}
 	mux.Handle("/mcp", auth.BearerMiddlewareWithMetadata(deps.Token, metadataURL, mcpHandler))
+	if !deps.Store.ReadOnly {
+		upload := auth.BearerMiddlewareWithMetadata(deps.Token, metadataURL, handleUpload(deps.Store, signer))
+		mux.Handle("PUT /attachments/{path...}", upload)
+		mux.Handle("POST /attachments/{path...}", upload)
+	}
 
 	return mux
 }
@@ -202,7 +209,7 @@ func newMCPServer(store *vault.Store, signer *render.Signer) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "list_attachments",
-		Description: "REQUIRED to discover images/PDFs — list_notes and search_notes skip binaries. Enumerate allowlisted attachments (png/jpg/jpeg/gif/webp/pdf by default) under a path prefix. Example: list_attachments({path_prefix: \"Pegasus\"}) → [{uri, path, name, mime_type, size, modified, url}]. Then call read_attachment with path, or resources/read on the returned wiki:// URI (URIs are percent-encoded). url, when present, is a short-lived Render Link (~6 h) for displaying the attachment inline in chat — not a permalink or share link. Size cap via HORDE_MAX_ATTACHMENT_BYTES.",
+		Description: "REQUIRED to discover images/PDFs — list_notes and search_notes skip binaries. Enumerate allowlisted attachments (png/jpg/jpeg/gif/webp/pdf by default) under a path prefix. Example: list_attachments({path_prefix: \"Pegasus\"}) → [{uri, path, name, mime_type, size, modified, url}]. Then call read_attachment with path, or resources/read on the returned wiki:// URI (URIs are percent-encoded). url and download_url, when present, are short-lived (~6 h) links — url displays the file inline in chat, download_url saves it to disk. Neither is a permalink or share link. Covers images, PDFs, and video (mp4/webm/mov).",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in listAttachmentsIn) (*mcp.CallToolResult, listAttachmentsOut, error) {
 		atts, err := store.ListAttachments(in.PathPrefix, in.Limit)
 		if err != nil {
@@ -213,6 +220,7 @@ func newMCPServer(store *vault.Store, signer *render.Signer) *mcp.Server {
 			out[i] = attachmentMetaOut{AttachmentMeta: att}
 			if signer != nil {
 				out[i].URL = signer.Mint(att.Path)
+				out[i].DownloadURL = downloadURL(out[i].URL)
 			}
 		}
 		return nil, listAttachmentsOut{Attachments: out}, nil
@@ -220,21 +228,39 @@ func newMCPServer(store *vault.Store, signer *render.Signer) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "read_attachment",
-		Description: "Fetch an allowlisted attachment (read-only). Example: read_attachment({path: \"Pegasus/90 Assets/Photos/pegasus.png\"}) or a wiki:// URI from list_attachments. Prefer the path field from list_attachments. Returns image content (for image/*) plus mime_type/path metadata. url, when present, is a short-lived Render Link (~6 h) for displaying the attachment inline in chat — not a permalink or share link. Rejects disallowed extensions, excluded dirs, and files over HORDE_MAX_ATTACHMENT_BYTES. Does not write binaries.",
+		Description: "Fetch an allowlisted attachment (read-only). Example: read_attachment({path: \"Pegasus/90 Assets/Photos/pegasus.png\"}) or a wiki:// URI from list_attachments. Prefer the path field from list_attachments. Returns image content (for small image/*) plus mime_type/path metadata, and sets inlined: true when it did. Video, and anything over HORDE_MAX_ATTACHMENT_BYTES, comes back as metadata with inlined: false — give the user url (view inline, ~6 h) or download_url (save the file) instead of trying to fetch bytes. Neither link is a permalink or share link. Rejects disallowed extensions and excluded dirs.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in readAttachmentIn) (*mcp.CallToolResult, readAttachmentOut, error) {
-		att, err := store.ReadAttachment(in.Path)
+		// Stat first: video and anything past the inline cap is returned as
+		// links rather than bytes, so a 200 MB clip answers with a URL
+		// instead of failing or trying to base64 itself into the response.
+		meta, err := store.StatAttachment(in.Path)
 		if err != nil {
 			return nil, readAttachmentOut{}, err
 		}
 		out := readAttachmentOut{
-			URI:      att.URI,
-			Path:     att.Path,
-			MIMEType: att.MIMEType,
-			Size:     att.Size,
+			URI:      meta.URI,
+			Path:     meta.Path,
+			MIMEType: meta.MIMEType,
+			Size:     meta.Size,
 		}
 		if signer != nil {
-			out.URL = signer.Mint(att.Path)
+			out.URL = signer.Mint(meta.Path)
+			out.DownloadURL = downloadURL(out.URL)
 		}
+		if config.IsStreamOnlyMIME(meta.MIMEType) || meta.Size > store.MaxAttachmentBytes {
+			if out.URL == "" {
+				return nil, readAttachmentOut{}, fmt.Errorf(
+					"%s is %d bytes (%s) — too large to return inline, and no HORDE_PUBLIC_URL is set to mint a download link",
+					meta.Path, meta.Size, meta.MIMEType)
+			}
+			out.Note = "Bytes not inlined — open url to view, or download_url to save the file."
+			return nil, out, nil
+		}
+		att, err := store.ReadAttachment(in.Path)
+		if err != nil {
+			return nil, readAttachmentOut{}, err
+		}
+		out.Inlined = true
 		return &mcp.CallToolResult{
 			Content: attachmentContent(att),
 		}, out, nil
@@ -258,7 +284,7 @@ func newMCPServer(store *vault.Store, signer *render.Signer) *mcp.Server {
 		URITemplate: "wiki://{wiki}/{+filepath}",
 		Name:        "vault-attachment",
 		Title:       "Vault attachment",
-		Description: "Read-only allowlisted attachment under HORDE_ROOT. URI example: wiki://network/diagrams/wan.png. Allowlist and size cap from HORDE_ATTACHMENT_EXTS / HORDE_MAX_ATTACHMENT_BYTES. Note tools do not return binary bytes.",
+		Description: "Allowlisted attachment under HORDE_ROOT. URI example: wiki://network/diagrams/wan.png. Allowlist and size cap from HORDE_ATTACHMENT_EXTS / HORDE_MAX_ATTACHMENT_BYTES; video is too large to read this way — use read_attachment and hand the user its download_url. Note tools do not return binary bytes.",
 		MIMEType:    "application/octet-stream",
 	}, readWikiResource)
 
@@ -330,6 +356,70 @@ func newMCPServer(store *vault.Store, signer *render.Signer) *mcp.Server {
 				commit = res.Commit
 			}
 			logTool("move_note", []string{in.From, in.To}, start, err, commit, 0)
+			if err != nil {
+				return nil, vault.MoveResult{}, err
+			}
+			return nil, *res, nil
+		})
+
+		mcp.AddTool(s, &mcp.Tool{
+			Name:        "create_attachment",
+			Description: "Upload an allowlisted attachment (png/jpg/jpeg/gif/webp/pdf by default) into a wiki. Example: create_attachment({path: \"Pegasus/90 Assets/Photos/rack.png\", content_base64: \"iVBORw0KGgo...\", overwrite: false}). content_base64 is standard base64 of the raw file bytes; the extension must match the allowlist and the decoded size must be under HORDE_MAX_ATTACHMENT_BYTES. For anything larger — video especially — PUT the raw bytes to /attachments/{path} with the bearer token instead, which streams and allows up to HORDE_MAX_STREAM_BYTES. Returns url and download_url for the stored file. Git-committed like note writes; embed it in a note with ![[filename]].",
+		}, func(ctx context.Context, req *mcp.CallToolRequest, in createAttachmentIn) (*mcp.CallToolResult, createAttachmentOut, error) {
+			start := time.Now()
+			data, decErr := base64.StdEncoding.DecodeString(strings.TrimSpace(in.ContentBase64))
+			if decErr != nil {
+				logTool("create_attachment", []string{in.Path}, start, decErr, "", 0)
+				return nil, createAttachmentOut{}, fmt.Errorf("content_base64 is not valid base64: %w", decErr)
+			}
+			res, err := store.WriteAttachment(in.Path, data, in.Overwrite)
+			var commit string
+			if res != nil {
+				commit = res.Commit
+			}
+			logTool("create_attachment", []string{in.Path}, start, err, commit, resBytes(res))
+			if err != nil {
+				return nil, createAttachmentOut{}, err
+			}
+			out := createAttachmentOut{WriteResult: *res, URI: paths.WikiURI(res.Path)}
+			if signer != nil {
+				out.URL = signer.Mint(res.Path)
+				out.DownloadURL = downloadURL(out.URL)
+			}
+			return nil, out, nil
+		})
+
+		mcp.AddTool(s, &mcp.Tool{
+			Name:        "delete_attachment",
+			Description: "Delete an attachment (git-recoverable, same as delete_note). Example: delete_attachment({path: \"Pegasus/90 Assets/Photos/rack.png\", confirm: true}). confirm must be true. Does not touch notes that embed the file — their ![[links]] will simply break.",
+		}, func(ctx context.Context, req *mcp.CallToolRequest, in deleteAttachmentIn) (*mcp.CallToolResult, vault.DeleteResult, error) {
+			if !in.Confirm {
+				return nil, vault.DeleteResult{}, fmt.Errorf("confirm must be true")
+			}
+			start := time.Now()
+			res, err := store.DeleteAttachment(in.Path)
+			var commit string
+			if res != nil {
+				commit = res.Commit
+			}
+			logTool("delete_attachment", []string{in.Path}, start, err, commit, 0)
+			if err != nil {
+				return nil, vault.DeleteResult{}, err
+			}
+			return nil, *res, nil
+		})
+
+		mcp.AddTool(s, &mcp.Tool{
+			Name:        "move_attachment",
+			Description: "Rename or move an attachment. Does not rewrite the ![[embeds]] pointing at it. Example: move_attachment({from: \"Pegasus/inbox/rack.png\", to: \"Pegasus/90 Assets/Photos/rack.png\", overwrite: false}). Both paths must be allowlisted attachment types inside a wiki.",
+		}, func(ctx context.Context, req *mcp.CallToolRequest, in moveAttachmentIn) (*mcp.CallToolResult, vault.MoveResult, error) {
+			start := time.Now()
+			res, err := store.MoveAttachment(in.From, in.To, in.Overwrite)
+			var commit string
+			if res != nil {
+				commit = res.Commit
+			}
+			logTool("move_attachment", []string{in.From, in.To}, start, err, commit, 0)
 			if err != nil {
 				return nil, vault.MoveResult{}, err
 			}
@@ -455,7 +545,8 @@ type listAttachmentsIn struct {
 // URL is empty (and omitted) when HORDE_PUBLIC_URL is not set.
 type attachmentMetaOut struct {
 	vault.AttachmentMeta
-	URL string `json:"url,omitempty"`
+	URL         string `json:"url,omitempty"`
+	DownloadURL string `json:"download_url,omitempty"`
 }
 
 type listAttachmentsOut struct {
@@ -472,6 +563,13 @@ type readAttachmentOut struct {
 	MIMEType string `json:"mime_type"`
 	Size     int64  `json:"size"`
 	URL      string `json:"url,omitempty"`
+	// DownloadURL is the same link with ?download=1, which saves the file
+	// instead of rendering it.
+	DownloadURL string `json:"download_url,omitempty"`
+	// Inlined is false when the bytes were too large (or video) to return in
+	// the response; the caller fetches them through the links instead.
+	Inlined bool   `json:"inlined"`
+	Note    string `json:"note,omitempty"`
 }
 
 // attachmentContent prefers MCP image content for image/* so Claude connectors
@@ -530,6 +628,30 @@ type moveNoteIn struct {
 	Overwrite bool   `json:"overwrite,omitempty" jsonschema:"Overwrite destination if it exists"`
 }
 
+type createAttachmentIn struct {
+	Path          string `json:"path" jsonschema:"Root-relative path inside a wiki, ending in an allowlisted attachment extension"`
+	ContentBase64 string `json:"content_base64" jsonschema:"Standard base64 encoding of the raw file bytes"`
+	Overwrite     bool   `json:"overwrite,omitempty" jsonschema:"Overwrite if the attachment already exists"`
+}
+
+type createAttachmentOut struct {
+	vault.WriteResult
+	URI         string `json:"uri"`
+	URL         string `json:"url,omitempty"`
+	DownloadURL string `json:"download_url,omitempty"`
+}
+
+type deleteAttachmentIn struct {
+	Path    string `json:"path" jsonschema:"Root-relative path to delete"`
+	Confirm bool   `json:"confirm" jsonschema:"Must be true to confirm deletion"`
+}
+
+type moveAttachmentIn struct {
+	From      string `json:"from" jsonschema:"Source path"`
+	To        string `json:"to" jsonschema:"Destination path"`
+	Overwrite bool   `json:"overwrite,omitempty" jsonschema:"Overwrite destination if it exists"`
+}
+
 func NewStore(opts StoreOpts) (*vault.Store, error) {
 	pv, err := paths.NewVault(opts.Root, opts.Ignore)
 	if err != nil {
@@ -541,12 +663,17 @@ func NewStore(opts StoreOpts) (*vault.Store, error) {
 	}
 	maxAtt := opts.MaxAttachmentBytes
 	if maxAtt <= 0 {
-		maxAtt = 5 * 1024 * 1024
+		maxAtt = config.DefaultMaxAttachmentBytes
+	}
+	maxStream := opts.MaxStreamBytes
+	if maxStream <= 0 {
+		maxStream = config.DefaultMaxStreamBytes
 	}
 	return &vault.Store{
 		Paths:              pv,
 		MaxNoteBytes:       maxNote,
 		MaxAttachmentBytes: maxAtt,
+		MaxStreamBytes:     maxStream,
 		AttachmentMIME:     opts.AttachmentMIME,
 		ReadLimitBytes:     vault.DefaultReadLimit,
 		Git:                opts.Git,
@@ -560,6 +687,7 @@ type StoreOpts struct {
 	Ignore             []string
 	MaxNoteBytes       int64
 	MaxAttachmentBytes int64
+	MaxStreamBytes     int64
 	AttachmentMIME     map[string]string
 	Git                *git.Repo
 	ReadOnly           bool

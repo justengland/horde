@@ -2,6 +2,7 @@ package git
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -24,6 +25,16 @@ func (r *Repo) CommitStages(tool string, relPaths ...string) (string, error) {
 		if err := r.run("add", "--", p); err != nil {
 			return "", fmt.Errorf("git add %s: %w", p, err)
 		}
+	}
+	// Rewriting a file with the bytes it already had stages nothing, and
+	// `git commit` fails on an empty diff. That is a no-op, not an error:
+	// the caller's write succeeded and the vault holds what they asked for.
+	staged, err := r.hasStagedChanges(relPaths)
+	if err != nil {
+		return "", err
+	}
+	if !staged {
+		return r.Head()
 	}
 	msg := fmt.Sprintf("mcp(%s): %s", tool, relPaths[0])
 	if len(relPaths) > 1 {
@@ -139,6 +150,28 @@ func (r *Repo) RecordRename(tool, from, to string, wasTracked bool) (string, err
 
 func (r *Repo) pushAsync() {
 	_ = r.run("push")
+}
+
+// hasStagedChanges reports whether any of relPaths differs from HEAD in the
+// index. `git diff --cached --quiet` exits 1 when there are differences, which
+// is a result rather than a failure — anything else is a real error.
+func (r *Repo) hasStagedChanges(relPaths []string) (bool, error) {
+	args := append([]string{"diff", "--cached", "--quiet", "--"}, relPaths...)
+	cmd := exec.Command("git", append([]string{"-C", r.Root}, args...)...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		return false, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return true, nil
+	}
+	if msg := strings.TrimSpace(stderr.String()); msg != "" {
+		return false, fmt.Errorf("git diff --cached: %w: %s", err, msg)
+	}
+	return false, fmt.Errorf("git diff --cached: %w", err)
 }
 
 func (r *Repo) run(args ...string) error {

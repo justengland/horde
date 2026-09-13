@@ -75,3 +75,51 @@ func contains(ss []string, want string) bool {
 	}
 	return false
 }
+
+// Rewriting a file with the bytes it already had stages nothing. git commit
+// fails on an empty diff, but the caller's write did succeed, so the commit
+// is a no-op that returns the unchanged HEAD rather than an error.
+func TestCommitStagesNoOpOnUnchangedContent(t *testing.T) {
+	root := t.TempDir()
+	initGitRepo(t, root)
+	repo := &git.Repo{Root: root}
+	path := filepath.Join(root, "network", "note.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("same bytes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := repo.CommitStages("create_note", "network/note.md")
+	if err != nil {
+		t.Fatalf("first commit: %v", err)
+	}
+	if first == "" {
+		t.Fatal("expected a commit hash")
+	}
+
+	// Same content again: no new commit, no error, HEAD unmoved.
+	if err := os.WriteFile(path, []byte("same bytes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	second, err := repo.CommitStages("update_note", "network/note.md")
+	if err != nil {
+		t.Fatalf("re-commit of identical content: %v", err)
+	}
+	if second != first {
+		t.Errorf("HEAD moved from %s to %s on an empty diff", first, second)
+	}
+
+	// A real change still commits.
+	if err := os.WriteFile(path, []byte("different bytes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	third, err := repo.CommitStages("update_note", "network/note.md")
+	if err != nil {
+		t.Fatalf("third commit: %v", err)
+	}
+	if third == first {
+		t.Error("expected a new commit for changed content")
+	}
+}

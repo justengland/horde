@@ -391,7 +391,7 @@ func newMCPServer(store *vault.Store, signer *render.Signer) *mcp.Server {
 
 		mcp.AddTool(s, &mcp.Tool{
 			Name:        "delete_attachment",
-			Description: "Delete an attachment (git-recoverable, same as delete_note). Example: delete_attachment({path: \"Pegasus/90 Assets/Photos/rack.png\", confirm: true}). confirm must be true. Does not touch notes that embed the file — their ![[links]] will simply break.",
+			Description: "Delete an attachment. Git-recoverable only if the file is in git; gitignored binaries return an empty commit and are recoverable only from the vault backup. Example: delete_attachment({path: \"Pegasus/90 Assets/Photos/rack.png\", confirm: true}). confirm must be true. Does not touch notes that embed the file — their ![[links]] will simply break.",
 		}, func(ctx context.Context, req *mcp.CallToolRequest, in deleteAttachmentIn) (*mcp.CallToolResult, vault.DeleteResult, error) {
 			if !in.Confirm {
 				return nil, vault.DeleteResult{}, fmt.Errorf("confirm must be true")

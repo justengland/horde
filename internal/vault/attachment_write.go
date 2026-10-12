@@ -164,7 +164,9 @@ func (s *Store) DeleteAttachment(pathOrURI string) (*DeleteResult, error) {
 			return nil, err
 		}
 		out.Commit = hash
-		out.RestoreHint = fmt.Sprintf("git checkout %s^ -- %s", hash, apiPath)
+		if hash != "" {
+			out.RestoreHint = fmt.Sprintf("git checkout %s^ -- %s", hash, apiPath)
+		}
 		return out, nil
 	}
 	if err := os.Remove(abs); err != nil {

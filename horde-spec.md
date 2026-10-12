@@ -95,10 +95,9 @@ Two independent layers; both must pass.
 - v1.5 candidates: `link_graph` tool; read-only attachment serving (§7).
 
 ### Backup strategy (git vs rclone)
-Git and the existing rclone→iDrive job solve different problems and both stay:
-- **Git** = versioning and blame for horde's edits. Local commits are the primary safety net; `HORDE_GIT_PUSH` to a private remote is optional convenience, not the backup.
-- **rclone→iDrive** = disaster recovery for the whole vault: attachments, `.obsidian/` config, and the `.git/` directory itself (which carries the full history offsite for free). Keep the existing schedule; ensure the job includes `.git/` and excludes nothing horde writes.
-One caveat: don't run `rclone sync` mid-write; horde's atomic rename makes torn files unlikely, but scheduling the job off-hours (or using `--backup-dir` versioning on iDrive) keeps restores clean.
+Git and the nightly rclone→iCloud job solve different problems and both stay (ADR-13):
+- **Git** = versioning and blame for **notes** (`.md`, `.canvas`). The vault `.gitignore` keeps binaries out; horde skips git for ignored paths (empty `commit`).
+- **rclone→iCloud** (`obsidian-backup.timer`, 02:30 nightly, `apples:horde-backup/`) = disaster recovery for the whole vault: binaries, `.obsidian/`, and `.git/`. `--backup-dir versions/<date>` keeps anything sync would delete or overwrite, which is the only recovery path for a deleted binary.
 
 ## 7. Tools
 
@@ -372,3 +371,6 @@ The system is designed to compound, not just persist. Three loops, smallest to l
 **Context:** ADR-10's route buffered whole files, served them with no `Content-Disposition`, and the allowlist stopped at PDF — so vault video could be neither stored nor served, and "view this" had no "keep this".
 **Decision:** Allowlist `mp4`/`m4v`/`webm`/`mov`; stream the route through `http.ServeContent` (Range support for video seeking and resumable downloads); split the caps by mechanism (`HORDE_MAX_ATTACHMENT_BYTES` for in-memory/base64 paths, `HORDE_MAX_STREAM_BYTES` for streaming HTTP ones); return `download_url` (`?download=1` → `Content-Disposition: attachment`) alongside `url` on every attachment tool; and have `read_attachment` stat first, returning links with `inlined: false` for video and oversize files. Full record: [docs/adr/0012-streaming-downloads-and-video.md](docs/adr/0012-streaming-downloads-and-video.md).
 **Consequences:** `.git/` grows faster with video blobs; downloads cost file descriptors and bandwidth rather than RAM; a leaked link now exposes a potentially much larger file for the same ~6 h; no transcoding or thumbnailing (horde serves what is in the vault).
+
+### ADR-13 — Binaries out of git; iCloud is their backup (2026-10-12)
+See `docs/adr/0013-binaries-out-of-git.md`. Supersedes the git parts of ADR-11/12.

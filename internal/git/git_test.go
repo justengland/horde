@@ -123,3 +123,42 @@ func TestCommitStagesNoOpOnUnchangedContent(t *testing.T) {
 		t.Error("expected a new commit for changed content")
 	}
 }
+
+// Gitignored paths (vault binaries, backed up outside git) are written to disk
+// but never committed; write, move, and delete all succeed without git.
+func TestIgnoredPathsSkipGit(t *testing.T) {
+	root := t.TempDir()
+	initGitRepo(t, root)
+	write := func(rel, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(root, rel), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(".gitignore", "*.png\n")
+	write("a.png", "png")
+	repo := &git.Repo{Root: root}
+	if _, err := repo.CommitStages("create_note", ".gitignore"); err != nil {
+		t.Fatal(err)
+	}
+	head, _ := repo.Head()
+
+	if hash, err := repo.CommitStages("create_attachment", "a.png"); err != nil || hash != "" {
+		t.Fatalf("create: hash=%q err=%v", hash, err)
+	}
+	if err := os.Rename(filepath.Join(root, "a.png"), filepath.Join(root, "b.png")); err != nil {
+		t.Fatal(err)
+	}
+	if hash, err := repo.RecordRename("move_attachment", "a.png", "b.png", false); err != nil || hash != "" {
+		t.Fatalf("move: hash=%q err=%v", hash, err)
+	}
+	if hash, err := repo.RemoveStages("delete_attachment", "b.png"); err != nil || hash != "" {
+		t.Fatalf("delete: hash=%q err=%v", hash, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "b.png")); !os.IsNotExist(err) {
+		t.Fatalf("b.png should be gone, stat err=%v", err)
+	}
+	if now, _ := repo.Head(); now != head {
+		t.Fatalf("ignored paths must not commit: %s -> %s", head, now)
+	}
+}

@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -17,9 +19,14 @@ type Repo struct {
 }
 
 // CommitStages stages explicit paths and commits. Never stages directories or trees.
+// Gitignored paths are skipped; if nothing is left it returns "" with no commit.
 func (r *Repo) CommitStages(tool string, relPaths ...string) (string, error) {
 	if len(relPaths) == 0 {
 		return "", fmt.Errorf("no paths to commit")
+	}
+	relPaths = r.unignored(relPaths)
+	if len(relPaths) == 0 {
+		return "", nil
 	}
 	for _, p := range relPaths {
 		if err := r.run("add", "--", p); err != nil {
@@ -58,6 +65,10 @@ func (r *Repo) RemoveStages(tool, relPath string) (string, error) {
 	tracked, err := r.IsTracked(relPath)
 	if err != nil {
 		return "", err
+	}
+	if !tracked && r.ignored(relPath) {
+		// Not in git, so nothing to record; the file's only copy is the backup.
+		return "", os.Remove(filepath.Join(r.Root, relPath))
 	}
 	if !tracked {
 		if err := r.run("add", "--", relPath); err != nil {
@@ -122,7 +133,14 @@ func (r *Repo) StagedFiles() ([]string, error) {
 
 // RecordRename stages a filesystem rename for commit.
 func (r *Repo) RecordRename(tool, from, to string, wasTracked bool) (string, error) {
-	if wasTracked {
+	if r.ignored(to) {
+		if !wasTracked {
+			return "", nil
+		}
+		if err := r.run("rm", "--cached", "--", from); err != nil {
+			return "", fmt.Errorf("git rm --cached %s: %w", from, err)
+		}
+	} else if wasTracked {
 		if err := r.run("add", "--", to); err != nil {
 			return "", fmt.Errorf("git add %s: %w", to, err)
 		}
@@ -146,6 +164,21 @@ func (r *Repo) RecordRename(tool, from, to string, wasTracked bool) (string, err
 		go r.pushAsync()
 	}
 	return hash, nil
+}
+
+// ignored reports whether .gitignore excludes relPath (check-ignore exits 0).
+func (r *Repo) ignored(relPath string) bool {
+	return exec.Command("git", "-C", r.Root, "check-ignore", "-q", "--", relPath).Run() == nil
+}
+
+func (r *Repo) unignored(relPaths []string) []string {
+	var keep []string
+	for _, p := range relPaths {
+		if !r.ignored(p) {
+			keep = append(keep, p)
+		}
+	}
+	return keep
 }
 
 func (r *Repo) pushAsync() {

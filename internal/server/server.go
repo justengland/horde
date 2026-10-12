@@ -364,7 +364,7 @@ func newMCPServer(store *vault.Store, signer *render.Signer) *mcp.Server {
 
 		mcp.AddTool(s, &mcp.Tool{
 			Name:        "create_attachment",
-			Description: "Upload an allowlisted attachment (png/jpg/jpeg/gif/webp/pdf by default) into a wiki. Example: create_attachment({path: \"Pegasus/90 Assets/Photos/rack.png\", content_base64: \"iVBORw0KGgo...\", overwrite: false}). content_base64 is standard base64 of the raw file bytes; the extension must match the allowlist and the decoded size must be under HORDE_MAX_ATTACHMENT_BYTES. For anything larger — video especially — PUT the raw bytes to /attachments/{path} with the bearer token instead, which streams and allows up to HORDE_MAX_STREAM_BYTES. Returns url and download_url for the stored file. Git-committed like note writes; embed it in a note with ![[filename]].",
+			Description: "Upload an allowlisted attachment (png/jpg/jpeg/gif/webp/pdf by default) into a wiki. Example: create_attachment({path: \"Pegasus/90 Assets/Photos/rack.png\", content_base64: \"iVBORw0KGgo...\", overwrite: false}). content_base64 is standard base64 of the raw file bytes; the extension must match the allowlist and the decoded size must be under HORDE_MAX_ATTACHMENT_BYTES. For anything larger — video especially — PUT the raw bytes to /attachments/{path} with the bearer token instead, which streams and allows up to HORDE_MAX_STREAM_BYTES. Returns url and download_url for the stored file. Committed to git unless the vault gitignores it (then commit is empty and the nightly backup covers it); embed it in a note with ![[filename]].",
 		}, func(ctx context.Context, req *mcp.CallToolRequest, in createAttachmentIn) (*mcp.CallToolResult, createAttachmentOut, error) {
 			start := time.Now()
 			data, decErr := base64.StdEncoding.DecodeString(strings.TrimSpace(in.ContentBase64))
@@ -391,7 +391,7 @@ func newMCPServer(store *vault.Store, signer *render.Signer) *mcp.Server {
 
 		mcp.AddTool(s, &mcp.Tool{
 			Name:        "delete_attachment",
-			Description: "Delete an attachment (git-recoverable, same as delete_note). Example: delete_attachment({path: \"Pegasus/90 Assets/Photos/rack.png\", confirm: true}). confirm must be true. Does not touch notes that embed the file — their ![[links]] will simply break.",
+			Description: "Delete an attachment. Git-recoverable only if the file is in git; gitignored binaries return an empty commit and are recoverable only from the vault backup. Example: delete_attachment({path: \"Pegasus/90 Assets/Photos/rack.png\", confirm: true}). confirm must be true. Does not touch notes that embed the file — their ![[links]] will simply break.",
 		}, func(ctx context.Context, req *mcp.CallToolRequest, in deleteAttachmentIn) (*mcp.CallToolResult, vault.DeleteResult, error) {
 			if !in.Confirm {
 				return nil, vault.DeleteResult{}, fmt.Errorf("confirm must be true")
